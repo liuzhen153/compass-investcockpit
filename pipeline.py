@@ -309,7 +309,7 @@ class PipelineEngine:
         task_prompt: str,
         skill_name: str,
         exec_id: str = None,
-        timeout: int = 3600,
+        timeout: int = 7200,
     ) -> dict:
         """
         使用 LLM API + tool calling 执行一个 Skill。
@@ -491,13 +491,65 @@ class PipelineEngine:
 
     # ── Skill 执行入口 ──────────────────────────────
 
+    def _find_latest_scout_file(self) -> str | None:
+        """返回工作目录中最新的侦察报告文件路径，没有则返回 None"""
+        scout_files = sorted(
+            Path(self.work_dir).glob("侦察-*.md"),
+            key=lambda f: f.stat().st_mtime, reverse=True,
+        )
+        return str(scout_files[0]) if scout_files else None
+
+    def _extract_sectors_from_scout(self) -> list[dict]:
+        """
+        从侦察报告中提取 S 级和 A 级赛道列表。
+        优先读取 .compass-scout-tracker.json（结构化数据），
+        回退到解析最新侦察-*.md 文件。
+        返回 [{"sector": "人形机器人/具身智能", "grade": "S"}, ...]，S 级在前。
+        """
+        # 方案 A：从 tracker JSON 读取
+        tracker_file = Path(self.work_dir) / ".compass-scout-tracker.json"
+        if tracker_file.exists():
+            try:
+                data = json.loads(tracker_file.read_text(encoding="utf-8"))
+                tracks = data.get("active_tracks", [])
+                sectors = [
+                    {"sector": t["sector"], "grade": t.get("current_grade", t.get("initial_grade", "A"))}
+                    for t in tracks
+                    if t.get("current_grade") in ("S", "A") or t.get("initial_grade") in ("S", "A")
+                ]
+                # S 级优先，同级别保持原序
+                sectors.sort(key=lambda x: (0 if x["grade"] == "S" else 1))
+                if sectors:
+                    return sectors
+            except Exception:
+                pass
+
+        # 方案 B：从侦察 .md 文件解析
+        scout_file = self._find_latest_scout_file()
+        if scout_file:
+            try:
+                content = Path(scout_file).read_text(encoding="utf-8")
+                sectors = []
+                # 匹配 S 级
+                for m in re.finditer(r'###\s*🟢\s*S\s*级[：:]\s*(.+)', content):
+                    sectors.append({"sector": m.group(1).strip(), "grade": "S"})
+                # 匹配 A 级
+                for m in re.finditer(r'###\s*🟡\s*A\s*级[：:]\s*(.+)', content):
+                    sectors.append({"sector": m.group(1).strip(), "grade": "A"})
+                if sectors:
+                    return sectors
+            except Exception:
+                pass
+
+        return []
+
     async def run_skill(
         self,
         skill_name: str,
         prompt: str,
         pipeline_run_id: str,
         sequence: int = 0,
-        timeout: int = 3600,
+        timeout: int = 7200,
     ) -> dict:
         """执行单个 Skill 并记录到数据库"""
         now = config.now()
@@ -562,15 +614,118 @@ class PipelineEngine:
                 "最后用 write_file 输出 个股-[股票名]-[YYYYMMDD]-[HHMM].md（例如 个股-绿的谐波-20260607-1430.md），engine 字段填 financial-compass v2.1.0。"
             )
         else:
+            # 直接读取最新侦察报告，提取 S/A 赛道名，无需 LLM 自行搜索
+            scout_file = self._find_latest_scout_file()
+            if scout_file:
+                try:
+                    content = Path(scout_file).read_text(encoding="utf-8")
+                    sectors = re.findall(r'###\s+[🟢🟡]\s+[SA]\s*级[：:]\s*(.+)', content)
+                    sector_list = "\n".join(f"  - {s}" for s in sectors) if sectors else "（无法解析，请自行判断）"
+                except Exception:
+                    sector_list = "（读取失败，请自行搜索判断）"
+            else:
+                scout_file = "（未找到侦察报告，请先运行 Scout）"
+                sector_list = "（无）"
             task = (
-                "扫描最近侦察报告中的 S 级和 A 级赛道，对每个赛道做深度分析（financial-compass v2.1）。\n"
-                "先 search 找到最新侦察报告文件，读取其中的 S/A 级赛道列表，"
-                "然后对每个赛道执行产业链定位和候选标的筛选。\n"
-                "用 write_file 输出 赛道-[赛道名]-[YYYYMMDD]-[HHMM].md。"
+                f"对侦察报告中的 S 级和 A 级赛道做深度分析（financial-compass v2.1）。\n\n"
+                f"侦察报告路径：{scout_file}\n"
+                f"已识别的 S/A 赛道：\n{sector_list}\n\n"
+                "对以上每个赛道执行完整研究流程：产业链定位 → 卡点判断 → 治理质量评估(C2) → "
+                "贝叶斯估值(C3) → 三情景估值(C4) → Benchmark 对比(E3) → "
+                "股东回报分析(C5) → 宏观校准 → 技术面(C6) → Adversarial Review(C1)。\n"
+                "需要数据时用 search domain=finance 获取财务/估值/行情数据。\n"
+                "用 write_file 输出 个股-[股票名]-[YYYYMMDD]-[HHMM].md，engine 字段填 financial-compass v2.1.0。"
             )
         return await self.run_skill(
             "financial-compass", task, pipeline_run_id, sequence=1,
         )
+
+    async def run_compass_multi_sector(
+        self,
+        pipeline_run_id: str,
+        sectors: list[dict] = None,
+        max_concurrent: int = 3,
+    ) -> dict:
+        """
+        对多个赛道并发执行 Compass 深度分析（最多 max_concurrent 个同时进行）。
+        sectors: [{"sector": "人形机器人", "grade": "S"}, ...]
+        返回聚合结果，包含所有赛道的输出文件和汇总状态。
+        """
+        if sectors is None:
+            sectors = self._extract_sectors_from_scout()
+
+        if not sectors:
+            return {
+                "success": True, "returncode": 0,
+                "output": "无 S/A 级赛道，跳过 Compass 分析。",
+                "error": None, "duration": 0, "output_files": [],
+                "sector_results": [],
+            }
+
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def analyze_one(sector_info: dict, seq: int) -> dict:
+            sector = sector_info["sector"]
+            grade = sector_info.get("grade", "A")
+            async with semaphore:
+                prompt = (
+                    f"对「{sector}」赛道进行深度分析（financial-compass v2.1）。\n"
+                    f"侦察评级：{grade} 级。\n\n"
+                    "执行完整研究流程：产业链定位 → 卡点判断 → 治理质量评估(C2) → "
+                    "贝叶斯估值(C3) → 三情景估值(C4) → Benchmark 对比(E3) → "
+                    "股东回报分析(C5) → 宏观校准 → 技术面(C6) → Adversarial Review(C1)。\n"
+                    "需要数据时用 search domain=finance 获取财务/估值/行情数据。\n"
+                    "最后用 write_file 输出 个股-[股票名]-[YYYYMMDD]-[HHMM].md，engine 字段填 financial-compass v2.1.0。"
+                )
+                return await self.run_skill(
+                    "financial-compass", prompt, pipeline_run_id,
+                    sequence=seq, timeout=7200,
+                )
+
+        # 并发执行（S 级优先，gather 维持提交顺序）
+        tasks = [analyze_one(s, i + 1) for i, s in enumerate(sectors)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 聚合结果
+        all_files = []
+        all_ok = True
+        any_ok = False
+        detail_parts = []
+
+        for i, r in enumerate(results):
+            sector_name = sectors[i]["sector"]
+            if isinstance(r, Exception):
+                all_ok = False
+                detail_parts.append(f"{sector_name}: \u274c ({r})")
+                continue
+            ok = r.get("success", False)
+            all_ok = all_ok and ok
+            any_ok = any_ok or ok
+            all_files.extend(r.get("output_files", []))
+            ok_mark = "✅" if ok else "❌"
+            detail_parts.append(f"{sector_name}: {ok_mark}")
+
+        status = "success" if all_ok else ("partial" if any_ok else "failed")
+        total_duration = sum(
+            r.get("duration", 0) for r in results if not isinstance(r, Exception)
+        )
+        summary = "Compass 多赛道: " + " | ".join(detail_parts)
+
+        return {
+            "success": any_ok,
+            "returncode": 0,
+            "output": "\n".join(detail_parts),
+            "error": None if any_ok else "全部赛道分析失败",
+            "duration": total_duration,
+            "output_files": all_files,
+            "sector_results": [
+                {"sector": sectors[i]["sector"], "grade": sectors[i]["grade"],
+                 "success": not isinstance(r, Exception) and r.get("success", False),
+                 "duration": r.get("duration", 0) if not isinstance(r, Exception) else 0}
+                for i, r in enumerate(results)
+            ],
+        }
+
 
     async def run_trader_update(self, pipeline_run_id: str) -> dict:
         task = (
@@ -603,26 +758,37 @@ class PipelineEngine:
 
         try:
             scout_result = await self.run_scout(run_id)
-            steps.append({"step": "scout", "status": "success" if scout_result["success"] else "failed"})
+            scout_ok = scout_result["success"]
+            steps.append({"step": "scout", "status": "success" if scout_ok else "failed"})
             all_output_files.extend(scout_result.get("output_files", []))
 
-            compass_result = await self.run_compass(run_id, sector)
-            steps.append({"step": "compass", "status": "success" if compass_result["success"] else "failed"})
+            # Compass: 如果 Scout 成功且有赛道列表，使用并发多赛道模式
+            if scout_ok and sector is None:
+                sectors = self._extract_sectors_from_scout()
+                if sectors:
+                    compass_result = await self.run_compass_multi_sector(run_id, sectors)
+                else:
+                    compass_result = await self.run_compass(run_id, sector)
+            else:
+                compass_result = await self.run_compass(run_id, sector)
+            compass_ok = compass_result["success"]
+            steps.append({"step": "compass", "status": "success" if compass_ok else "failed"})
             all_output_files.extend(compass_result.get("output_files", []))
 
             trader_result = await self.run_trader_update(run_id)
-            steps.append({"step": "trader", "status": "success" if trader_result["success"] else "failed"})
+            trader_ok = trader_result["success"]
+            steps.append({"step": "trader", "status": "success" if trader_ok else "failed"})
             all_output_files.extend(trader_result.get("output_files", []))
 
-            all_ok = scout_result["success"] and compass_result["success"] and trader_result["success"]
-            any_ok = scout_result["success"] or compass_result["success"] or trader_result["success"]
+            all_ok = scout_ok and compass_ok and trader_ok
+            any_ok = scout_ok or compass_ok or trader_ok
             status = "success" if all_ok else ("partial" if any_ok else "failed")
 
             duration = sum(r.get("duration", 0) for r in [scout_result, compass_result, trader_result])
-            summary = f"Scout: {'✅' if scout_result['success'] else '❌'} | "
-            summary += f"Compass: {'✅' if compass_result['success'] else '❌'} | "
-            summary += f"Trader: {'✅' if trader_result['success'] else '❌'} | "
-            summary += f"文件: {len(all_output_files)} 个"
+            scout_mark = "OK" if scout_ok else "XX"
+            compass_mark = "OK" if compass_ok else "XX"
+            trader_mark = "OK" if trader_ok else "XX"
+            summary = f"Scout: {scout_mark} | Compass: {compass_mark} | Trader: {trader_mark} | 文件: {len(all_output_files)} 个"
         except Exception as e:
             status = "failed"
             duration = 0
@@ -646,13 +812,21 @@ class PipelineEngine:
             if skill_name == "compass-scout":
                 result = await self.run_scout(run_id)
             elif skill_name == "financial-compass":
-                result = await self.run_compass(run_id, sector)
+                if sector is None:
+                    sectors = self._extract_sectors_from_scout()
+                    if sectors:
+                        result = await self.run_compass_multi_sector(run_id, sectors)
+                    else:
+                        result = await self.run_compass(run_id, sector)
+                else:
+                    result = await self.run_compass(run_id, sector)
             elif skill_name == "compass-trader":
                 result = await self.run_trader_update(run_id)
             else:
                 raise ValueError(f"未知 Skill: {skill_name}")
+            success_mark = "OK" if result.get("success") else "XX"
             status = "success" if result.get("success") else "failed"
-            summary = f"{skill_name}: {'✅' if result.get('success') else '❌'}"
+            summary = f"{skill_name}: {success_mark}"
             self.finalize_pipeline_run(run_id, status, result.get("duration", 0),
                                        summary=summary,
                                        output_files=result.get("output_files", []))
