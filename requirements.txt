@@ -1,9 +1,10 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
-apscheduler>=4.0.0
+apscheduler>=3.10.0
 sqlalchemy>=2.0.0
 aiosqlite>=0.20.0
 cn-stock-holidays>=2.1.0
 jinja2>=3.1.0
 python-multipart>=0.0.20
 httpx>=0.28.0
+anthropic>=0.49.0

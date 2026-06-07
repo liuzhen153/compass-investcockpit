@@ -3,9 +3,10 @@ Compass InvestCockpit — Web 管理界面 (FastAPI)
 启动: python3 main.py
 访问: http://localhost:8888
 """
+import asyncio
 import json
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Form, HTTPException
@@ -21,6 +22,22 @@ from pipeline import engine as pipeline_engine
 from calendar_utils import is_trading_day, next_trading_day, is_trading_time, get_trading_days_range
 from scheduler import scheduler, start_scheduler, shutdown_scheduler, load_tasks_from_db, _get_job_func
 
+# ── 后台任务追踪 ──────────────────────────────────
+_background_tasks: set[asyncio.Task] = set()
+_MAX_CONCURRENT = 3  # 最多同时运行的后台任务数
+
+
+def _fire_background_task(coro):
+    """创建后台任务并追踪，完成后自动清理。超过并发上限则拒绝。"""
+    running = sum(1 for t in _background_tasks if not t.done())
+    if running >= _MAX_CONCURRENT:
+        raise HTTPException(429, f"已有 {running} 个任务在运行，最多 {_MAX_CONCURRENT} 个并发。请等待当前任务完成后再试。")
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
 # ── 应用初始化 ────────────────────────────────────
 from contextlib import asynccontextmanager
 
@@ -29,6 +46,10 @@ async def lifespan(app: FastAPI):
     init_db()
     start_scheduler()
     yield
+    # 关闭时取消所有进行中的后台任务
+    for task in list(_background_tasks):
+        if not task.done():
+            task.cancel()
     shutdown_scheduler()
 
 app = FastAPI(
@@ -215,17 +236,20 @@ async def api_tasks():
 
 @app.post("/api/tasks/{task_id}/run")
 async def api_run_task(task_id: str):
-    """手动触发任务"""
+    """手动触发任务（异步后台执行）"""
     session = SyncSession()
     try:
         task = session.query(TaskConfig).filter_by(id=task_id).first()
         if not task:
             raise HTTPException(404, "任务不存在")
-        result = await pipeline_engine.run_full_pipeline(
-            run_type="manual",
-            task_id=task_id,
+        run_id = pipeline_engine.create_pipeline_run(run_type="manual", task_id=task_id)
+        _fire_background_task(
+            pipeline_engine.run_full_pipeline(run_type="manual", task_id=task_id, run_id=run_id)
         )
-        return {"status": "ok", "result": result}
+        # 更新 last_run_at
+        task.last_run_at = config.now()
+        session.commit()
+        return {"status": "accepted", "run_id": run_id, "message": "任务已触发，后台执行中"}
     finally:
         session.close()
 
@@ -325,10 +349,21 @@ async def api_results(type: str = None, limit: int = 50):
         files = [f for f in files if f["type"] == type]
     return files[:limit]
 
+def _safe_work_path(path: str) -> Path:
+    """将路径限制在工作目录内，防止路径遍历"""
+    p = Path(path).resolve()
+    work = config.WORK_DIR.resolve()
+    try:
+        p.relative_to(work)
+    except ValueError:
+        raise HTTPException(403, "禁止访问工作目录外的文件")
+    return p
+
+
 @app.get("/api/results/file")
 async def api_read_file(path: str):
-    """读取输出文件内容"""
-    file_path = Path(path)
+    """读取输出文件内容（仅限工作目录内 .md 文件）"""
+    file_path = _safe_work_path(path)
     if not file_path.exists():
         raise HTTPException(404, "文件不存在")
     if file_path.suffix != ".md":
@@ -338,8 +373,8 @@ async def api_read_file(path: str):
 
 @app.get("/api/results/file/raw")
 async def api_download_file(path: str):
-    """直接返回文件内容（用于 Markdown 渲染）"""
-    file_path = Path(path)
+    """直接返回文件内容（仅限工作目录内）"""
+    file_path = _safe_work_path(path)
     if not file_path.exists():
         raise HTTPException(404, "文件不存在")
     return FileResponse(str(file_path), media_type="text/plain; charset=utf-8")
@@ -364,34 +399,41 @@ async def api_calendar(days: int = 30):
 
 @app.post("/api/pipeline/run")
 async def api_run_pipeline(task_id: str = Form(None), sector: str = Form(None)):
-    """手动触发完整流水线"""
-    result = await pipeline_engine.run_full_pipeline(
-        run_type="manual",
-        task_id=task_id,
-        sector=sector,
+    """手动触发完整流水线（异步后台执行）"""
+    run_id = pipeline_engine.create_pipeline_run(run_type="manual", task_id=task_id)
+    _fire_background_task(
+        pipeline_engine.run_full_pipeline(run_type="manual", task_id=task_id,
+                                          sector=sector, run_id=run_id)
     )
-    return result
+    return {"status": "accepted", "run_id": run_id, "message": "流水线已触发，后台执行中"}
 
 @app.post("/api/pipeline/scout")
 async def api_run_scout():
-    """单独运行 Scout"""
-    run_id = generate_id()
-    result = await pipeline_engine.run_scout(run_id)
-    return {"run_id": run_id, "result": result}
+    """单独运行 Scout（异步后台执行）"""
+    run_id = pipeline_engine.create_pipeline_run(run_type="manual")
+    _fire_background_task(
+        pipeline_engine.execute_skill("compass-scout", run_type="manual", run_id=run_id)
+    )
+    return {"status": "accepted", "run_id": run_id, "message": "Scout 已触发"}
 
 @app.post("/api/pipeline/compass")
 async def api_run_compass(sector: str = Form(None)):
-    """单独运行 Compass"""
-    run_id = generate_id()
-    result = await pipeline_engine.run_compass(run_id, sector)
-    return {"run_id": run_id, "result": result}
+    """单独运行 Compass（异步后台执行）"""
+    run_id = pipeline_engine.create_pipeline_run(run_type="manual")
+    _fire_background_task(
+        pipeline_engine.execute_skill("financial-compass", run_type="manual",
+                                      sector=sector, run_id=run_id)
+    )
+    return {"status": "accepted", "run_id": run_id, "message": "Compass 已触发"}
 
 @app.post("/api/pipeline/trader")
 async def api_run_trader():
-    """单独运行 Trader 更新"""
-    run_id = generate_id()
-    result = await pipeline_engine.run_trader_update(run_id)
-    return {"run_id": run_id, "result": result}
+    """单独运行 Trader 更新（异步后台执行）"""
+    run_id = pipeline_engine.create_pipeline_run(run_type="manual")
+    _fire_background_task(
+        pipeline_engine.execute_skill("compass-trader", run_type="manual", run_id=run_id)
+    )
+    return {"status": "accepted", "run_id": run_id, "message": "Trader 已触发"}
 
 
 # ── 启动入口 ──────────────────────────────────────

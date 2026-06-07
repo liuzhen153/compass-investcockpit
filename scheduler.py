@@ -4,7 +4,7 @@ Compass InvestCockpit — APScheduler 定时任务调度
 任务配置持久化在 SQLite 的 task_configs 表中，启动时自动恢复
 """
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.jobstores.memory import MemoryJobStore
@@ -37,9 +37,23 @@ scheduler = AsyncIOScheduler(
 )
 
 
+# ── SKILL 名映射 ──────────────────────────────────
+TASK_TYPE_TO_SKILL = {
+    "scout_": "compass-scout",
+    "compass_": "financial-compass",
+    "trader_": "compass-trader",
+}
+
+def _task_type_to_skill(task_type: str) -> str:
+    for prefix, skill in TASK_TYPE_TO_SKILL.items():
+        if task_type.startswith(prefix):
+            return skill
+    return "custom"
+
+
 # ── 模块级任务执行函数（可被 pickle）────────────
 async def scheduled_job_func(task_id: str):
-    """定时任务执行入口 — 从 DB 读取任务信息后执行"""
+    """定时任务执行入口 — 创建 PipelineRun 后执行，确保在历史中可见"""
     session = SyncSession()
     try:
         task = session.query(TaskConfig).filter_by(id=task_id).first()
@@ -50,23 +64,21 @@ async def scheduled_job_func(task_id: str):
         if task.trading_day_only and not should_run_today(trading_day_only=True):
             return {"skipped": True, "reason": "非交易日"}
 
+        # 创建 PipelineRun 记录（定时任务在历史中可见）
+        run_id = pipeline_engine.create_pipeline_run(
+            run_type="scheduled", task_id=task_id
+        )
+
         task_type = task.task_type
-        prompt_template = task.prompt_template
+        skill_name = _task_type_to_skill(task_type)
 
         # 执行
-        if task_type.startswith("scout_"):
-            result = await pipeline_engine.run_scout(pipeline_run_id=generate_id())
-        elif task_type.startswith("compass_"):
-            result = await pipeline_engine.run_compass(pipeline_run_id=generate_id())
-        elif task_type.startswith("trader_"):
-            result = await pipeline_engine.run_trader_update(pipeline_run_id=generate_id())
-        else:
-            result = await pipeline_engine._run_claude(
-                prompt_template, "custom", session_id=str(__import__("uuid").uuid4())
-            )
+        result = await pipeline_engine.execute_skill(
+            skill_name, run_type="scheduled", task_id=task_id, run_id=run_id
+        )
 
         # 更新 last_run_at
-        task.last_run_at = datetime.now(timezone.utc)
+        task.last_run_at = config.now()
         session.commit()
         return result
 

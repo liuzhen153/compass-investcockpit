@@ -102,28 +102,25 @@ async function previewFile(path, filename) {
   try {
     const resp = await fetch(`/api/results/file?path=${path}`);
     const data = await resp.json();
-    // 简单的 Markdown → HTML 转换
-    let html = data.content
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/^### (.+)$/gm, '<h3>$1</h3>')
-      .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-      .replace(/^# (.+)$/gm, '<h1>$1</h1>')
-      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*(.+?)\*/g, '<em>$1</em>')
-      .replace(/`([^`]+)`/g, '<code>$1</code>')
-      .replace(/^- (.+)$/gm, '<li>$1</li>')
-      .replace(/^---$/gm, '<hr>')
-      .replace(/\n\n/g, '</p><p>')
-      .replace(/\|(.+)\|/g, (match) => {
-        const cells = match.split('|').filter(c => c.trim());
-        if (cells.every(c => /^[-:]+$/.test(c.trim()))) return '';
-        const tag = match.includes('\n-') ? 'th' : 'td';
-        return '<tr>' + cells.map(c => `<${tag}>${c.trim()}</${tag}>`).join('') + '</tr>';
+    // 使用 marked.js CDN 渲染 Markdown（若失败则降级为原始文本）
+    let html;
+    if (typeof marked !== 'undefined') {
+      html = marked.parse(data.content);
+    } else {
+      // 降级：加载 marked.js
+      const script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/npm/marked/marked.min.js';
+      await new Promise((resolve, reject) => {
+        script.onload = resolve;
+        script.onerror = reject;
+        document.head.appendChild(script);
       });
-
-    content.innerHTML = '<p>' + html + '</p>';
+      html = marked.parse(data.content);
+    }
+    content.innerHTML = html;
   } catch(e) {
-    content.innerHTML = `<p class="text-red">加载失败: ${e.message}</p>`;
+    // CDN 不可用时降级为预格式化文本
+    content.innerHTML = `<pre style="white-space:pre-wrap;font-size:13px;line-height:1.6">${data.content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>`;
   }
 }
 

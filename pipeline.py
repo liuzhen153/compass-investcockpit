@@ -1,17 +1,17 @@
 """
 Compass InvestCockpit — Skill 流水线执行引擎
-通过 subprocess 调用 Claude Code CLI 运行各 Skill
+通过 Anthropic SDK 调用 LLM API + AnySearch JSON-RPC 工具调用
 """
 from __future__ import annotations
 import asyncio
 import json
-import os
 import re
-import subprocess
-import uuid
-from datetime import datetime, timezone
+import time as time_module
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
+
+import anthropic
+import httpx
 
 import config
 from models import (
@@ -19,104 +19,436 @@ from models import (
 )
 
 
+# ── AnySearch 工具定义（Anthropic tool format）─────────
+ANYSEARCH_TOOLS = [
+    {
+        "name": "search",
+        "description": "搜索网络。query: 搜索关键词（自然语言）。max_results: 返回结果数（默认10，最大10）。"
+                       "domain/sub_domain/sub_domain_params: 垂直搜索参数，必须先通过 get_sub_domains 获取。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "自然语言搜索查询"},
+                "max_results": {"type": "integer", "default": 10, "maximum": 10},
+                "domain": {"type": "string", "description": "垂直领域（可选）"},
+                "sub_domain": {"type": "string", "description": "子领域（可选）"},
+                "sub_domain_params": {"type": "object", "description": "子领域参数（可选）"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "batch_search",
+        "description": "批量搜索（最多5个并行查询）。queries: 查询数组，每项包含 query 和可选的 domain/sub_domain/sub_domain_params。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "queries": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "maxItems": 5,
+                    "description": "搜索查询数组，每项有 query 字段和可选的 domain/sub_domain/sub_domain_params",
+                },
+            },
+            "required": ["queries"],
+        },
+    },
+    {
+        "name": "extract",
+        "description": "获取网页完整内容（Markdown 格式）。url: 网页 URL。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "要获取的网页 URL"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "get_sub_domains",
+        "description": "获取垂直搜索的子领域列表。domain: 单个领域；domains: 多个领域数组（推荐）。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string"},
+                "domains": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+            },
+        },
+    },
+]
+
+# ── 写文件工具 ─────────────────────────────────────
+WRITE_FILE_TOOL = {
+    "name": "write_file",
+    "description": "将内容写入文件。filename: 文件名（如 侦察-20260607-1430.md），若同名文件已存在会自动追加唯一后缀。content: Markdown 内容。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "filename": {"type": "string", "description": "输出文件名"},
+            "content": {"type": "string", "description": "Markdown 格式的文件内容"},
+        },
+        "required": ["filename", "content"],
+    },
+}
+
+# ── Bash 执行工具（Compass Trader 用）───────────────
+RUN_BASH_TOOL = {
+    "name": "run_bash",
+    "description": "执行 bash 命令并返回输出。用于运行 Python 脚本等。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "要执行的 bash 命令"},
+        },
+        "required": ["command"],
+    },
+}
+
+
 class PipelineEngine:
-    """流水线执行引擎"""
+    """流水线执行引擎 — 基于 LLM API + 工具调用"""
 
     def __init__(self):
         self.work_dir = str(config.WORK_DIR)
-        self.claude_bin = config.CLAUDE_BIN
+        self.anysearch_url = config.ANYSEARCH_MCP_URL
+        self.client = anthropic.AsyncAnthropic(
+            base_url=config.LLM_BASE_URL,
+            api_key=config.LLM_API_KEY,
+            timeout=600.0,  # 每次 API 调用最长 10 分钟
+            max_retries=2,
+        )
+        self.model = config.LLM_MODEL
+        self._skill_prompts: dict[str, str] = {}
+        self._load_skill_prompts()
 
-    def _claude_args(self, prompt: str, session_id: str | None = None) -> list[str]:
-        """构建 Claude CLI 参数"""
-        args = [
-            self.claude_bin,
-            "-p",
-            "--no-session-persistence",
-            "--permission-mode", "bypassPermissions",
-            f"--add-dir={self.work_dir}",
-            prompt,  # prompt 必须放在 --add-dir 之后（否则 --add-dir 会吃掉它）
-        ]
-        if session_id:
-            args.insert(1, "--session-id")
-            args.insert(2, session_id)
-        return args
+    # ── Skill prompt 加载 ──────────────────────────
 
-    async def _run_claude(
+    def _load_skill_prompts(self):
+        """加载所有 Skill 的 SKILL.md 作为 system prompt"""
+        skill_dirs = {
+            "compass-scout": config.SCOUT_SKILL_DIR,
+            "financial-compass": config.COMPASS_SKILL_DIR,
+            "compass-trader": config.TRADER_SKILL_DIR,
+        }
+        for name, d in skill_dirs.items():
+            skill_md = d / "SKILL.md"
+            if skill_md.exists():
+                prompt = skill_md.read_text(encoding="utf-8")
+                prompt = re.sub(r'^---\n.*?\n---\n', '', prompt, flags=re.DOTALL)
+                self._skill_prompts[name] = prompt.strip()
+            else:
+                print(f"[Pipeline] WARNING: SKILL.md not found at {skill_md}, skill '{name}' will use empty prompt")
+                self._skill_prompts[name] = ""
+
+    def _require_system_prompt(self, skill_name: str) -> str:
+        """获取 system prompt，若为空则报错"""
+        prompt = self._skill_prompts.get(skill_name, "")
+        if not prompt or len(prompt) < 100:
+            print(f"[Pipeline] WARNING: System prompt for '{skill_name}' is empty or too short ({len(prompt)} chars), LLM may produce garbage output")
+        return prompt
+
+    # ── 数据库辅助 ──────────────────────────────────
+
+    def create_pipeline_run(self, run_type: str = "manual", task_id: str = None) -> str:
+        run_id = generate_id()
+        now = config.now()
+        session = SyncSession()
+        try:
+            session.add(PipelineRun(
+                id=run_id, task_id=task_id, run_type=run_type,
+                status="running", started_at=now,
+            ))
+            session.commit()
+            return run_id
+        finally:
+            session.close()
+
+    def finalize_pipeline_run(self, run_id: str, status: str, duration: float = 0,
+                               summary: str = "", output_files: list = None,
+                               error: str = None):
+        session = SyncSession()
+        try:
+            run = session.query(PipelineRun).filter_by(id=run_id).first()
+            if run:
+                run.status = status
+                run.finished_at = config.now()
+                run.duration_seconds = duration
+                run.summary = summary or run.summary
+                if output_files is not None:
+                    run.output_files = output_files
+                if error is not None:
+                    run.error_message = error
+                session.commit()
+        finally:
+            session.close()
+
+    def _flush_output(self, exec_id: str, text: str):
+        """实时刷新输出到 DB —— 保留最近 8000 字符"""
+        if not exec_id or not text:
+            return
+        session = SyncSession()
+        try:
+            ex = session.query(SkillExecution).filter_by(id=exec_id).first()
+            if ex:
+                current = ex.output_text or ""
+                # 合并存量和新内容，保留尾部
+                merged = (current + "\n" + text) if current else text
+                ex.output_text = merged[-8000:]
+                session.commit()
+        finally:
+            session.close()
+
+    # ── AnySearch JSON-RPC ─────────────────────────
+
+    async def _anysearch_rpc(self, tool_name: str, arguments: dict) -> str:
+        """直接通过 JSON-RPC 调用 AnySearch MCP，无 SSE"""
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    self.anysearch_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": tool_name, "arguments": arguments},
+                    },
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+                if "error" in data:
+                    return f"Error: {data['error']}"
+
+                result = data.get("result", {})
+                content = result.get("content", [])
+
+                # 提取文本内容
+                texts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        texts.append(item.get("text", ""))
+                    elif isinstance(item, str):
+                        texts.append(item)
+
+                return "\n\n".join(texts) if texts else json.dumps(result, ensure_ascii=False)
+        except Exception as e:
+            return f"AnySearch 调用失败: {str(e)}"
+
+    # ── 工具执行 ────────────────────────────────────
+
+    async def _execute_tool(self, tool_name: str, arguments: dict, skill_name: str,
+                            exec_id: str = None) -> str:
+        """执行工具调用并返回结果文本"""
+        if tool_name in ("search", "batch_search", "extract", "get_sub_domains"):
+            return await self._anysearch_rpc(tool_name, arguments)
+
+        elif tool_name == "write_file":
+            filename = arguments.get("filename", "output.md")
+            content = arguments.get("content", "")
+            filepath = Path(self.work_dir) / filename
+            # 防覆盖：若文件已存在，自动插入唯一后缀
+            if filepath.exists():
+                stem = filepath.stem
+                suffix = filepath.suffix
+                unique_tag = exec_id[:8] if exec_id else generate_id()[:8]
+                filepath = Path(self.work_dir) / f"{stem}-{unique_tag}{suffix}"
+            filepath.write_text(content, encoding="utf-8")
+            return f"文件已写入: {filepath} ({len(content)} 字符)"
+
+        elif tool_name == "run_bash":
+            cmd = arguments.get("command", "")
+            # 如果是 Trader 脚本，在 skill 目录下执行
+            cwd = self.work_dir
+            if "compass-trader" in cmd or "scripts/" in cmd:
+                trader_dir = config.TRADER_SKILL_DIR
+                if trader_dir.exists():
+                    cwd = str(trader_dir)
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=cwd,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=300
+                )
+                out = stdout.decode("utf-8", errors="replace")
+                err = stderr.decode("utf-8", errors="replace")
+                result = out
+                if err:
+                    result += f"\n[stderr]\n{err}"
+                return f"Exit: {proc.returncode}\n{result[:8000]}"
+            except asyncio.TimeoutError:
+                return "命令超时 (300秒)"
+            except Exception as e:
+                return f"命令执行失败: {str(e)}"
+
+        else:
+            return f"未知工具: {tool_name}"
+
+    # ── 工具列表（按 Skill）────────────────────────
+
+    def _get_tools(self, skill_name: str) -> list[dict]:
+        """返回某个 Skill 可用的工具定义"""
+        tools = list(ANYSEARCH_TOOLS)
+        tools.append(WRITE_FILE_TOOL)
+        if skill_name == "compass-trader":
+            tools.append(RUN_BASH_TOOL)
+        return tools
+
+    # ── 核心：Tool Calling Loop ─────────────────────
+
+    async def _run_llm_agent(
         self,
-        prompt: str,
+        system_prompt: str,
+        task_prompt: str,
         skill_name: str,
-        session_id: str | None = None,
-        timeout: int = 1800,
+        exec_id: str = None,
+        timeout: int = 3600,
     ) -> dict:
         """
-        异步执行 Claude CLI，返回结果字典
-        timeout 默认 30 分钟（深度分析可能较慢）
+        使用 LLM API + tool calling 执行一个 Skill。
+        边执行边将输出刷新到 DB（output_text 字段）。
         """
-        args = self._claude_args(prompt, session_id)
-        started = datetime.now(timezone.utc)
+        tools = self._get_tools(skill_name)
+        messages: list = [{"role": "user", "content": task_prompt}]
+        all_output: list[str] = []
+        all_files: list[dict] = []
+        started = config.now()
 
-        env = os.environ.copy()
-        env["NO_PROXY"] = "*"
-        env["no_proxy"] = "*"
+        max_turns = 50  # 防止无限循环
+        for turn in range(max_turns):
+            elapsed = (config.now() - started).total_seconds()
+            if elapsed > timeout:
+                self._flush_output(exec_id, "\n⏰ 执行超时\n")
+                return {
+                    "success": False,
+                    "returncode": -1,
+                    "output": "".join(all_output)[:5000],
+                    "error": f"执行超时 ({timeout}秒)",
+                    "duration": elapsed,
+                    "output_files": all_files,
+                }
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=self.work_dir,
-                env=env,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
-            finished = datetime.now(timezone.utc)
-            duration = (finished - started).total_seconds()
+            try:
+                response = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=32000,
+                    system=system_prompt,
+                    messages=messages,
+                    tools=tools,
+                )
+            except Exception as e:
+                error_msg = str(e)
+                self._flush_output(exec_id, "".join(all_output[-300:]))
+                return {
+                    "success": False,
+                    "returncode": -1,
+                    "output": "".join(all_output)[:5000],
+                    "error": f"API 调用失败: {error_msg}",
+                    "duration": (config.now() - started).total_seconds(),
+                    "output_files": all_files,
+                }
 
-            output = stdout.decode("utf-8", errors="replace")
-            error_output = stderr.decode("utf-8", errors="replace")
+            # 解析响应
+            text_parts = []
+            tool_uses = []
 
-            # 从输出中提取生成的文件路径
-            output_files = self._extract_output_files(output, skill_name)
+            for block in response.content:
+                if block.type == "text":
+                    text_parts.append(block.text)
+                elif block.type == "tool_use":
+                    tool_uses.append(block)
 
-            return {
-                "success": proc.returncode == 0,
-                "returncode": proc.returncode,
-                "output": output[:5000],  # 截断长输出
-                "error": error_output[:2000] if error_output else None,
-                "duration": duration,
-                "output_files": output_files,
-            }
-        except asyncio.TimeoutError:
-            finished = datetime.now(timezone.utc)
-            return {
-                "success": False,
-                "returncode": -1,
-                "output": "",
-                "error": f"执行超时 ({timeout}秒)",
-                "duration": (finished - started).total_seconds(),
-                "output_files": [],
-            }
-        except Exception as e:
-            finished = datetime.now(timezone.utc)
-            return {
-                "success": False,
-                "returncode": -1,
-                "output": "",
-                "error": str(e),
-                "duration": (finished - started).total_seconds(),
-                "output_files": [],
-            }
+            all_output.extend(text_parts)
+
+            # 实时刷新到 DB
+            if text_parts:
+                self._flush_output(exec_id, "".join(all_output[-2000:]))
+
+            # 没有 tool call → 完成
+            if not tool_uses:
+                duration = (config.now() - started).total_seconds()
+                # 提取输出文件
+                full_output = "".join(all_output)
+                all_files = self._extract_output_files(full_output, skill_name)
+                return {
+                    "success": True,
+                    "returncode": 0,
+                    "output": full_output[:5000],
+                    "error": None,
+                    "duration": duration,
+                    "output_files": all_files,
+                }
+
+            # 执行工具调用
+            tool_results = []
+            for tc in tool_uses:
+                args = dict(tc.input) if hasattr(tc.input, 'items') else {}
+                all_output.append(f"\n🔧 调用工具: {tc.name}...\n")
+                self._flush_output(exec_id, f"🔧 调用工具: {tc.name}...\n")
+
+                result_text = await self._execute_tool(tc.name, args, skill_name, exec_id)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tc.id,
+                    "content": result_text[:50000],  # 截断过长结果
+                })
+
+            # 构建下一轮消息
+            # Assistant 消息：包含 text 和 tool_use blocks
+            assistant_content = []
+            for block in response.content:
+                if block.type == "text":
+                    assistant_content.append({"type": "text", "text": block.text})
+                elif block.type == "tool_use":
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": dict(block.input) if hasattr(block.input, 'items') else {},
+                    })
+
+            messages.append({"role": "assistant", "content": assistant_content})
+            messages.append({"role": "user", "content": tool_results})
+
+            # 上下文窗口管理：超过 20 条消息时截断旧的 tool 结果
+            # 保留 system prompt 作用 + 最近 15 条消息
+            if len(messages) > 20:
+                # 保留第一条（原始 task prompt）和最近 18 条
+                messages = [messages[0]] + messages[-18:]
+
+        # 达到最大轮次
+        duration = (config.now() - started).total_seconds()
+        full_output = "".join(all_output)
+        all_files = self._extract_output_files(full_output, skill_name)
+        return {
+            "success": False,
+            "returncode": -1,
+            "output": full_output[:5000],
+            "error": f"达到最大轮次 ({max_turns})",
+            "duration": duration,
+            "output_files": all_files,
+        }
+
+    # ── 输出文件提取 ────────────────────────────────
 
     def _extract_output_files(self, output: str, skill_name: str) -> list[dict]:
-        """从 Claude 输出中提取生成的文件路径"""
         files = []
-        # 匹配常见的文件路径模式
         patterns = [
-            r'([\w一-鿿]+-[\w一-鿿]+-\d{8,}-?\d*\.md)',  # 个股-xxx-20260607.md
-            r'([\w一-鿿]+-[\w一-鿿]+-\d{8,}\.md)',      # 赛道-xxx-20260607.md
-            r'(\d{4}-\d{2}-\d{2}.*?\.md)',                              # 周报/月报
-            r'(\w+-[\w一-鿿]+\.md)',                             # 侦察-20260607.md
+            # 多段前缀优先：个股-绿的谐波-20260607-1430.md / 赛道-AI半导体-20260607-1430.md
+            r'([\w一-鿿]+(?:-[\w一-鿿]+)+-\d{8}(?:-\d{4,})?(?:-[a-f0-9]{6,12})?\.md)',
+            # 单段前缀 + 日期时间：侦察-20260607-1430.md / 侦察-20260607-1430-a1b2c3d4.md
+            r'([\w一-鿿]+-\d{8}-\d{4}(?:-[a-f0-9]{6,12})?\.md)',
+            # 旧格式兼容：侦察-20260607.md / 操作摘要-20260607.md
+            r'([\w一-鿿]+-\d{8}\.md)',
+            # 兜底：日期开头格式
+            r'(\d{4}-\d{2}-\d{2}.*?\.md)',
         ]
         seen = set()
         for pattern in patterns:
@@ -131,8 +463,6 @@ class PipelineEngine:
                         "skill": skill_name,
                         "exists": full_path.exists(),
                     })
-
-        # 另外扫描工作目录中最近创建的文件
         try:
             recent_files = self._find_recent_md_files(skill_name)
             for rf in recent_files:
@@ -141,14 +471,11 @@ class PipelineEngine:
                     files.append(rf)
         except Exception:
             pass
-
         return files
 
     def _find_recent_md_files(self, skill_name: str, minutes: int = 5) -> list[dict]:
-        """查找工作目录中最近创建的 .md 文件作为回退检测"""
-        import time
         files = []
-        cutoff = time.time() - minutes * 60
+        cutoff = time_module.time() - minutes * 60
         try:
             for f in Path(self.work_dir).glob("*.md"):
                 if f.stat().st_mtime > cutoff:
@@ -162,50 +489,50 @@ class PipelineEngine:
             pass
         return files
 
+    # ── Skill 执行入口 ──────────────────────────────
+
     async def run_skill(
         self,
         skill_name: str,
         prompt: str,
         pipeline_run_id: str,
         sequence: int = 0,
-        session_id: str | None = None,
-    ) -> SkillExecution:
+        timeout: int = 3600,
+    ) -> dict:
         """执行单个 Skill 并记录到数据库"""
-        now = datetime.now(timezone.utc)
+        now = config.now()
         exec_id = generate_id()
 
-        # 创建执行记录
         session = SyncSession()
         try:
-            execution = SkillExecution(
+            session.add(SkillExecution(
                 id=exec_id,
                 pipeline_run_id=pipeline_run_id,
                 skill_name=skill_name,
                 sequence=sequence,
                 status="running",
                 prompt=prompt,
-                claude_session_id=session_id,
                 started_at=now,
-            )
-            session.add(execution)
+            ))
             session.commit()
         finally:
             session.close()
 
-        # 执行
-        result = await self._run_claude(prompt, skill_name, session_id)
+        system_prompt = self._require_system_prompt(skill_name)
+        result = await self._run_llm_agent(
+            system_prompt, prompt, skill_name, exec_id, timeout
+        )
 
-        # 更新执行记录
         session = SyncSession()
         try:
-            execution = session.query(SkillExecution).filter_by(id=exec_id).first()
-            if execution:
-                execution.status = "success" if result["success"] else "failed"
-                execution.finished_at = datetime.now(timezone.utc)
-                execution.duration_seconds = result["duration"]
-                execution.output_text = result["output"][:2000]
-                execution.output_files = result["output_files"]
-                execution.error_message = result.get("error")
+            ex = session.query(SkillExecution).filter_by(id=exec_id).first()
+            if ex:
+                ex.status = "success" if result["success"] else "failed"
+                ex.finished_at = config.now()
+                ex.duration_seconds = result["duration"]
+                ex.output_text = result["output"][:2000]
+                ex.output_files = result["output_files"]
+                ex.error_message = result.get("error")
                 session.commit()
         finally:
             session.close()
@@ -213,140 +540,135 @@ class PipelineEngine:
         return result
 
     async def run_scout(self, pipeline_run_id: str) -> dict:
-        """运行 Compass Scout — 全市场热点扫描"""
-        prompt = (
-            "使用 compass-scout 技能执行全市场热门赛道侦察扫描。"
-            "执行三大映射信号搜索（政策/海外/一级市场），输出信号矩阵，"
-            "对命中 ≥2 信号的赛道进行五维交叉验证，输出 S/A/B/C 四级赛道排序。"
-            "将侦察报告写入 .md 文件。"
-        )
         return await self.run_skill(
-            "compass-scout", prompt, pipeline_run_id, sequence=0,
-            session_id=str(uuid.uuid4()),
+            "compass-scout",
+            "执行全市场热门赛道侦察扫描（compass-scout v1.1）。\n"
+            "分两步：\n"
+            "1. 用 batch_search 并行扫描三大映射信号（政策/海外/一级市场各 3-5 路），输出信号矩阵；\n"
+            "2. 对命中 ≥2 信号的前 5 赛道做五维交叉验证——其中维度三（量价热度）可用 search domain=finance 获取 A 股成交量和涨跌幅数据；\n"
+            "3. 最后调用 write_file 将完整报告（含 YAML 元信息、信号矩阵、深度卡片、风险证据）写入 侦察-[YYYYMMDD]-[HHMM].md（例如 侦察-20260607-1430.md）。\n"
+            "注意：engine 字段填 compass-scout v1.1.0。",
+            pipeline_run_id, sequence=0,
         )
 
     async def run_compass(self, pipeline_run_id: str, sector: str = None) -> dict:
-        """运行 Financial Compass — 对发现的赛道进行深度分析"""
         if sector:
-            prompt = (
-                f"使用 financial-compass 技能对「{sector}」赛道进行深度扫描分析。"
-                f"执行产业链定位、卡点判断、候选标的筛选、反向 DCF 估值。"
-                f"输出赛道分析 .md 文件。"
+            task = (
+                f"对「{sector}」赛道进行深度分析（financial-compass v2.1）。\n"
+                "执行完整研究流程：产业链定位 → 卡点判断 → 治理质量评估(C2) → "
+                "贝叶斯估值(C3) → 三情景估值(C4) → Benchmark 对比(E3) → "
+                "股东回报分析(C5) → 宏观校准 → 技术面(C6) → Adversarial Review(C1)。\n"
+                "需要数据时用 search domain=finance 获取财务/估值/行情数据。\n"
+                "最后用 write_file 输出 个股-[股票名]-[YYYYMMDD]-[HHMM].md（例如 个股-绿的谐波-20260607-1430.md），engine 字段填 financial-compass v2.1.0。"
             )
         else:
-            prompt = (
-                "使用 financial-compass 技能对最近侦察发现的 S 级和 A 级赛道进行深度分析。"
-                "扫描赛道，对每个赛道执行产业链定位和候选标的筛选。"
-                "输出赛道分析 .md 文件。"
+            task = (
+                "扫描最近侦察报告中的 S 级和 A 级赛道，对每个赛道做深度分析（financial-compass v2.1）。\n"
+                "先 search 找到最新侦察报告文件，读取其中的 S/A 级赛道列表，"
+                "然后对每个赛道执行产业链定位和候选标的筛选。\n"
+                "用 write_file 输出 赛道-[赛道名]-[YYYYMMDD]-[HHMM].md。"
             )
         return await self.run_skill(
-            "financial-compass", prompt, pipeline_run_id, sequence=1,
-            session_id=str(uuid.uuid4()),
+            "financial-compass", task, pipeline_run_id, sequence=1,
         )
 
     async def run_trader_update(self, pipeline_run_id: str) -> dict:
-        """运行 Compass Trader — 更新持仓与绩效"""
-        prompt = (
-            "使用 compass-trader 技能执行以下操作："
-            "1. 运行 python3 scripts/market_data.py batch 获取持仓标的行情 "
-            "2. 运行 python3 scripts/portfolio.py update-all-prices 更新持仓现价 "
-            "3. 运行 python3 scripts/portfolio.py snapshot 记录当日快照 "
-            "4. 如果今天是周五，运行 python3 scripts/reporter.py weekly 生成本周周报。"
+        task = (
+            "执行持仓更新（compass-trader v1.1）。\n"
+            "注意：所有脚本在 ~/.claude/skills/compass-trader/scripts/ 目录下。\n"
+            "1. run_bash: python3 ~/.claude/skills/compass-trader/scripts/market_data.py batch 获取持仓行情\n"
+            "2. run_bash: python3 ~/.claude/skills/compass-trader/scripts/portfolio.py update-all-prices\n"
+            "3. run_bash: python3 ~/.claude/skills/compass-trader/scripts/portfolio.py snapshot\n"
+            "4. 如果今天是周五，run_bash: python3 ~/.claude/skills/compass-trader/scripts/reporter.py weekly\n"
+            "完成后用 write_file 输出 操作摘要-[YYYYMMDD]-[HHMM].md。"
         )
         return await self.run_skill(
-            "compass-trader", prompt, pipeline_run_id, sequence=2,
-            session_id=str(uuid.uuid4()),
+            "compass-trader", task, pipeline_run_id, sequence=2,
         )
+
+    # ── 完整流水线 ──────────────────────────────────
 
     async def run_full_pipeline(
         self,
         run_type: str = "manual",
         task_id: str = None,
         sector: str = None,
-    ) -> PipelineRun:
-        """运行完整流水线：Scout → Compass → Trader"""
-        run_id = generate_id()
-        now = datetime.now(timezone.utc)
-
-        # 创建流水线记录
-        session = SyncSession()
-        try:
-            run = PipelineRun(
-                id=run_id,
-                task_id=task_id,
-                run_type=run_type,
-                status="running",
-                started_at=now,
-            )
-            session.add(run)
-            session.commit()
-        finally:
-            session.close()
+        run_id: str = None,
+    ) -> dict:
+        if run_id is None:
+            run_id = self.create_pipeline_run(run_type, task_id)
 
         all_output_files = []
         steps = []
 
         try:
-            # Step 1: Scout
             scout_result = await self.run_scout(run_id)
             steps.append({"step": "scout", "status": "success" if scout_result["success"] else "failed"})
             all_output_files.extend(scout_result.get("output_files", []))
 
-            # Step 2: Financial Compass (分析发现的赛道)
             compass_result = await self.run_compass(run_id, sector)
             steps.append({"step": "compass", "status": "success" if compass_result["success"] else "failed"})
             all_output_files.extend(compass_result.get("output_files", []))
 
-            # Step 3: Trader (更新持仓)
             trader_result = await self.run_trader_update(run_id)
             steps.append({"step": "trader", "status": "success" if trader_result["success"] else "failed"})
             all_output_files.extend(trader_result.get("output_files", []))
 
-            # 判断整体状态
             all_ok = scout_result["success"] and compass_result["success"] and trader_result["success"]
             any_ok = scout_result["success"] or compass_result["success"] or trader_result["success"]
-            if all_ok:
-                status = "success"
-            elif any_ok:
-                status = "partial"
-            else:
-                status = "failed"
+            status = "success" if all_ok else ("partial" if any_ok else "failed")
 
             duration = sum(r.get("duration", 0) for r in [scout_result, compass_result, trader_result])
             summary = f"Scout: {'✅' if scout_result['success'] else '❌'} | "
             summary += f"Compass: {'✅' if compass_result['success'] else '❌'} | "
             summary += f"Trader: {'✅' if trader_result['success'] else '❌'} | "
             summary += f"文件: {len(all_output_files)} 个"
-
         except Exception as e:
             status = "failed"
             duration = 0
             summary = f"流水线异常: {str(e)}"
             all_output_files = []
 
-        # 更新流水线记录
-        session = SyncSession()
-        try:
-            run = session.query(PipelineRun).filter_by(id=run_id).first()
-            if run:
-                run.status = status
-                run.finished_at = datetime.now(timezone.utc)
-                run.duration_seconds = duration
-                run.summary = summary
-                run.output_files = all_output_files
-                session.commit()
-        finally:
-            session.close()
+        self.finalize_pipeline_run(run_id, status, duration, summary, all_output_files)
 
         return {
-            "id": run_id,
-            "status": status,
-            "duration_seconds": duration,
-            "summary": summary,
-            "steps": steps,
-            "output_files": all_output_files,
+            "id": run_id, "status": status,
+            "duration_seconds": duration, "summary": summary,
+            "steps": steps, "output_files": all_output_files,
         }
 
+    async def execute_skill(self, skill_name: str, run_type: str = "manual",
+                            task_id: str = None, sector: str = None,
+                            run_id: str = None) -> str:
+        if run_id is None:
+            run_id = self.create_pipeline_run(run_type, task_id)
+        try:
+            if skill_name == "compass-scout":
+                result = await self.run_scout(run_id)
+            elif skill_name == "financial-compass":
+                result = await self.run_compass(run_id, sector)
+            elif skill_name == "compass-trader":
+                result = await self.run_trader_update(run_id)
+            else:
+                raise ValueError(f"未知 Skill: {skill_name}")
+            status = "success" if result.get("success") else "failed"
+            summary = f"{skill_name}: {'✅' if result.get('success') else '❌'}"
+            self.finalize_pipeline_run(run_id, status, result.get("duration", 0),
+                                       summary=summary,
+                                       output_files=result.get("output_files", []))
+        except Exception as e:
+            self.finalize_pipeline_run(run_id, "failed", 0,
+                                       summary=f"{skill_name}: 异常", error=str(e))
+        return run_id
 
-# 单例
+    async def execute_full_pipeline(self, run_type: str = "manual",
+                                    task_id: str = None, sector: str = None,
+                                    run_id: str = None) -> str:
+        if run_id is None:
+            run_id = self.create_pipeline_run(run_type, task_id)
+        await self.run_full_pipeline(run_type=run_type, task_id=task_id,
+                                     sector=sector, run_id=run_id)
+        return run_id
+
+
 engine = PipelineEngine()

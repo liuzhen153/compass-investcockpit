@@ -2,7 +2,16 @@
 Compass InvestCockpit — 配置模块
 """
 import os
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+# ── 时区 ──────────────────────────────────────────────
+TZ = ZoneInfo("Asia/Shanghai")
+
+def now():
+    """返回东 8 区当前时间"""
+    return datetime.now(TZ)
 
 # ── 路径配置 ──────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -19,8 +28,33 @@ TRADER_SKILL_DIR = SKILLS_DIR / "compass-trader"
 # 工作目录（Skill 输出文件写入此目录）
 WORK_DIR = Path.home() / "financial"
 
-# Claude CLI
-CLAUDE_BIN = "claude"
+# ── LLM API（替代 Claude CLI）────────────────────────
+def _load_api_key() -> str:
+    """加载 LLM API Key，优先级：环境变量 > Claude Code settings.json"""
+    key = os.environ.get("LLM_API_KEY")
+    if key:
+        return key
+    # 回退：从 Claude Code 配置读取
+    cc_settings = Path.home() / ".claude" / "settings.json"
+    if cc_settings.exists():
+        try:
+            import json
+            with open(cc_settings) as f:
+                data = json.load(f)
+            envs = data.get("env", {})
+            key = envs.get("ANTHROPIC_AUTH_TOKEN", "")
+            if key:
+                return key
+        except Exception:
+            pass
+    return ""
+
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/anthropic")
+LLM_API_KEY = _load_api_key()
+LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-pro[1m]")
+
+# AnySearch MCP（JSON-RPC 直连，非 SSE）
+ANYSEARCH_MCP_URL = os.environ.get("ANYSEARCH_MCP_URL", "https://api.anysearch.com/mcp")
 
 # ── 数据库 ────────────────────────────────────────────
 DATABASE_URL = f"sqlite+aiosqlite:///{DATA_DIR / 'compass-investcockpit.db'}"

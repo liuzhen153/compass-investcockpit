@@ -12,6 +12,8 @@
   --orange: #ff9800;
   --yellow: #fdd835;
   --purple: #ab47bc;
+  --primary: #42a5f5;
+  --highlight-bg: #fff8e1;
 }
 
 * { margin:0; padding:0; box-sizing:border-box; }
@@ -283,8 +285,35 @@ tr:hover { background: var(--surface2); }
 }
 
 .pipeline-step.done { border-color: var(--green); }
+.pipeline-step.success { border-color: var(--green); background: rgba(38,166,154,.08); }
 .pipeline-step.failed { border-color: var(--red); }
 .pipeline-step.running { border-color: var(--blue); animation: pulse 1.5s infinite; }
+.pipeline-step.active { border-color: var(--blue); background: rgba(66,165,245,.08); }
+
+/* Pipeline table — 流水线运行列表 */
+.pipeline-table { min-width: 600px; }
+.pipeline-table td { padding: 12px 14px; font-size: 14px; vertical-align: middle; }
+.pipeline-table th { padding: 10px 14px; }
+
+.run-id { font-size: 13px; color: var(--blue); }
+
+.steps-cell { display: flex; gap: 10px; align-items: center; }
+
+.step-dot {
+  display: inline-block;
+  width: 18px; height: 18px;
+  line-height: 18px;
+  text-align: center;
+  border-radius: 50%;
+  font-size: 11px;
+}
+.step-dot.pending  { color: var(--text2); background: rgba(139,143,163,.15); }
+.step-dot.running  { color: var(--blue); background: rgba(66,165,245,.20); animation: pulse 1s infinite; }
+.step-dot.success  { color: var(--green); background: rgba(38,166,154,.20); }
+.step-dot.failed   { color: var(--red); background: rgba(239,83,80,.20); }
+
+.row-running { background: rgba(66,165,245,.06); }
+.row-alt { background: rgba(255,255,255,.02); }
 
 @keyframes pulse {
   0%,100% { opacity: 1; }

@@ -90,13 +90,21 @@
       </div>
     </div>
 
+    <!-- 实时输出（运行中时显示） -->
+    <div class="section" id="live-output-section" style="display:none">
+      <div class="section-title">📡 实时输出 <span id="live-output-label" class="text-sm text-muted"></span></div>
+      <div class="card">
+        <pre id="live-output" style="max-height:400px;overflow-y:auto;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-all;background:var(--bg);padding:16px;border-radius:6px;margin:0"></pre>
+      </div>
+    </div>
+
     <!-- 最近流水线运行 -->
     <div class="section">
       <div class="section-title">📋 最近流水线运行</div>
-      <div class="table-container">
-        <table>
-          <thead><tr><th>Run ID</th><th>状态</th><th>开始</th><th>耗时</th><th>Scout</th><th>Compass</th><th>Trader</th><th>文件</th></tr></thead>
-          <tbody id="pipeline-runs"><tr><td colspan="8" class="text-muted">加载中...</td></tr></tbody>
+      <div class="table-container" style="overflow-x:auto">
+        <table class="pipeline-table">
+          <thead><tr><th style="width:140px">时间</th><th>Run ID</th><th>状态</th><th>步骤进度</th><th style="width:70px">耗时</th><th style="width:50px">文件</th></tr></thead>
+          <tbody id="pipeline-runs"><tr><td colspan="6" class="text-muted">加载中...</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -104,41 +112,198 @@
 </div>
 
 <script>
+// ── 活跃的轮询跟踪 ──────────────────────────────
+let activePolls = {};
+
+function stopPoll(runId) {
+  if (activePolls[runId]) {
+    clearInterval(activePolls[runId]);
+    delete activePolls[runId];
+  }
+}
+
+async function pollRun(runId, statusEl, label) {
+  const POLL_INTERVAL = 2000;  // 2 秒轮询
+  const MAX_POLL_TIME = 60 * 60 * 1000;  // 最长 60 分钟
+  const startTime = Date.now();
+
+  stopPoll(runId);
+  activePolls[runId] = setInterval(async () => {
+    try {
+      const resp = await fetch(`/api/history/${runId}`);
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const run = await resp.json();
+
+      // 更新流水线可视化状态
+      updatePipelineViz(run);
+
+      // 更新状态指示
+      const statusText = { running: '⏳', success: '✅', failed: '❌', partial: '⚠️' };
+      const icon = statusText[run.status] || '🔄';
+      statusEl.innerHTML = `${icon} ${run.status} (${runId.substring(0,8)}...)`;
+
+      // 实时输出 — 取最新 execution 的 output_text
+      if (run.executions && run.executions.length > 0) {
+        const latestExec = run.executions[run.executions.length - 1];
+        // 如果至少一个 execution 有 output_text，显示面板
+        const anyOutput = run.executions.some(e => e.output_text && e.output_text.length > 0);
+        if (anyOutput) {
+          document.getElementById('live-output-section').style.display = '';
+          document.getElementById('live-output-label').textContent =
+            `${latestExec.skill_name} · ${latestExec.status}`;
+          const outEl = document.getElementById('live-output');
+          // 显示当前运行中 execution 的输出
+          const runningExec = run.executions.find(e => e.status === 'running') || latestExec;
+          if (runningExec.output_text) {
+            outEl.textContent = runningExec.output_text;
+            outEl.scrollTop = outEl.scrollHeight;
+          }
+        }
+      }
+
+      // 完成或失败时停止轮询
+      if (run.status === 'success' || run.status === 'failed' || run.status === 'partial') {
+        stopPoll(runId);
+        statusEl.innerHTML = `${icon} ${run.status} · ${run.duration_seconds ? Math.round(run.duration_seconds) + 's' : ''}`;
+        loadPipeline();
+        resetPipelineViz();
+        // 完成后 10 秒隐藏实时输出
+        setTimeout(() => {
+          document.getElementById('live-output-section').style.display = 'none';
+        }, 10000);
+      }
+
+      // 超时保护
+      if (Date.now() - startTime > MAX_POLL_TIME) {
+        stopPoll(runId);
+        statusEl.innerHTML = `⏰ 超时 · 请查看 <a href="/history">运行历史</a>`;
+        loadPipeline();
+      }
+    } catch (e) {
+      console.error('Poll error:', e);
+    }
+  }, POLL_INTERVAL);
+}
+
+function updatePipelineViz(run) {
+  // 高亮流水线步骤状态
+  const steps = document.querySelectorAll('#pipeline-viz .pipeline-step');
+  const skillMap = { 'compass-scout': 0, 'financial-compass': 1, 'compass-trader': 2 };
+  const statusClass = { running: 'running', success: 'success', failed: 'failed', pending: '' };
+
+  if (run.executions) {
+    run.executions.forEach(e => {
+      const idx = skillMap[e.skill_name];
+      if (idx !== undefined && steps[idx]) {
+        steps[idx].classList.add(statusClass[e.status] || 'running');
+        const small = steps[idx].querySelector('small');
+        if (small) small.textContent = e.status === 'running' ? '执行中...' :
+          e.status === 'success' ? `✅ ${Math.round(e.duration_seconds || 0)}s` :
+          e.status === 'failed' ? '❌ 失败' : e.status;
+      }
+    });
+  }
+
+  if (run.status === 'running') {
+    const runningExec = (run.executions || []).find(e => e.status === 'running');
+    if (runningExec) {
+      const idx = skillMap[runningExec.skill_name];
+      if (idx !== undefined && steps[idx]) {
+        steps[idx].classList.add('active');
+      }
+    }
+  }
+}
+
+function resetPipelineViz() {
+  document.querySelectorAll('#pipeline-viz .pipeline-step').forEach(s => {
+    s.classList.remove('running', 'success', 'failed', 'active');
+    const small = s.querySelector('small');
+    if (small) {
+      const origText = small.getAttribute('data-original');
+      if (origText) small.textContent = origText;
+    }
+  });
+}
+
+// 保存原始文本
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('#pipeline-viz .pipeline-step small').forEach(s => {
+    s.setAttribute('data-original', s.textContent);
+  });
+});
+
+// ── 加载历史列表 ────────────────────────────────
+function formatTime(iso) {
+  if (!iso) return '-';
+  const d = new Date(iso);
+  const pad = n => String(n).padStart(2, '0');
+  return `${pad(d.getMonth()+1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function stepBadge(exec, label) {
+  if (!exec) return '<span class="step-dot pending"></span>';
+  const cls = exec.status;  // running | success | failed
+  const icon = { running: '◌', success: '●', failed: '✕' }[cls] || '○';
+  const tip = `${label}: ${exec.status}` + (exec.duration_seconds ? ` ${Math.round(exec.duration_seconds)}s` : '');
+  return `<span class="step-dot ${cls}" title="${tip}">${icon}</span>`;
+}
+
 async function loadPipeline() {
   try {
     const resp = await fetch('/api/history');
     const runs = await resp.json();
-    document.getElementById('pipeline-runs').innerHTML = runs.map(r => {
-      const scoutExec = r.executions?.find(e => e.skill_name === 'compass-scout');
-      const compassExec = r.executions?.find(e => e.skill_name === 'financial-compass');
-      const traderExec = r.executions?.find(e => e.skill_name === 'compass-trader');
+    document.getElementById('pipeline-runs').innerHTML = runs.map((r, i) => {
+      const s = r.executions?.find(e => e.skill_name === 'compass-scout');
+      const c = r.executions?.find(e => e.skill_name === 'financial-compass');
+      const t = r.executions?.find(e => e.skill_name === 'compass-trader');
+
+      const isRunning = r.status === 'running';
+      const dur = r.duration_seconds ? Math.round(r.duration_seconds) + 's' : (isRunning ? '⏳' : '-');
+      const rowClass = isRunning ? 'row-running' : (i % 2 === 0 ? '' : 'row-alt');
+      const statusCN = { running: '运行中', success: '成功', failed: '失败', partial: '部分', pending: '等待' };
+
       return `
-        <tr>
-          <td><code>${r.id}</code></td>
-          <td><span class="status-badge ${r.status}">${r.status}</span></td>
-          <td class="text-sm">${r.started_at ? new Date(r.started_at).toLocaleString('zh-CN') : '-'}</td>
-          <td>${r.duration_seconds ? Math.round(r.duration_seconds) + 's' : '-'}</td>
-          <td>${scoutExec ? `<span class="status-badge ${scoutExec.status}">${scoutExec.duration_seconds ? Math.round(scoutExec.duration_seconds)+'s' : scoutExec.status}</span>` : '-'}</td>
-          <td>${compassExec ? `<span class="status-badge ${compassExec.status}">${compassExec.duration_seconds ? Math.round(compassExec.duration_seconds)+'s' : compassExec.status}</span>` : '-'}</td>
-          <td>${traderExec ? `<span class="status-badge ${traderExec.status}">${traderExec.duration_seconds ? Math.round(traderExec.duration_seconds)+'s' : traderExec.status}</span>` : '-'}</td>
-          <td class="text-sm">${(r.output_files || []).length} 个</td>
+        <tr class="${rowClass}">
+          <td class="text-sm text-muted">${formatTime(r.started_at)}</td>
+          <td><code class="run-id">${r.id.substring(0,8)}</code></td>
+          <td><span class="status-badge ${r.status}">${isRunning ? '⏳' : ''} ${statusCN[r.status] || r.status}</span></td>
+          <td class="steps-cell">
+            ${stepBadge(s, 'Scout')} ${stepBadge(c, 'Compass')} ${stepBadge(t, 'Trader')}
+          </td>
+          <td class="text-sm">${dur}</td>
+          <td class="text-sm text-muted">${(r.output_files || []).length || 0}</td>
         </tr>
       `;
-    }).join('') || '<tr><td colspan="8" class="text-muted">暂无记录</td></tr>';
+    }).join('') || '<tr><td colspan="6" class="text-muted">暂无记录</td></tr>';
+
+    // 自动轮询所有 running 状态的任务
+    runs.filter(r => r.status === 'running').forEach(r => {
+      if (!activePolls[r.id]) {
+        const statusEl = document.getElementById('pipeline-status');
+        pollRun(r.id, statusEl, 'auto');
+      }
+    });
   } catch(e) { console.error(e); }
 }
 
+// ── 触发流水线（fire-and-poll）──────────────────
 async function runFullPipeline() {
   const s = document.getElementById('pipeline-status');
   const sector = document.getElementById('pipeline-sector').value;
-  s.innerHTML = '<span class="spinner"></span> 流水线运行中...';
   try {
     const form = new FormData();
     if (sector) form.append('sector', sector);
     const resp = await fetch('/api/pipeline/run', { method: 'POST', body: form });
     const data = await resp.json();
-    s.innerHTML = `<span class="text-${data.status === 'success' ? 'green' : 'red'}">${data.status}: ${data.summary || ''}</span>`;
-    loadPipeline();
+
+    if (data.status === 'accepted') {
+      s.innerHTML = `<span style="color:var(--primary)">🚀 已触发 · ${data.run_id.substring(0,8)}...</span>`;
+      pollRun(data.run_id, s, 'pipeline');
+      loadPipeline();
+    } else {
+      s.innerHTML = `<span class="text-red">错误: ${JSON.stringify(data)}</span>`;
+    }
   } catch(e) {
     s.innerHTML = `<span class="text-red">错误: ${e.message}</span>`;
   }
@@ -146,17 +311,23 @@ async function runFullPipeline() {
 
 async function runSingle(type) {
   const el = document.getElementById(type + '-status');
-  el.innerHTML = '<span class="spinner"></span>';
   try {
     const resp = await fetch('/api/pipeline/' + type, { method: 'POST' });
     const data = await resp.json();
-    el.innerHTML = `<span class="text-${data.result?.success ? 'green' : 'red'}">${data.result?.success ? '✅' : '❌'}</span>`;
-    loadPipeline();
+
+    if (data.status === 'accepted') {
+      el.innerHTML = `<span style="color:var(--primary)">🚀 已触发</span>`;
+      pollRun(data.run_id, el, type);
+      loadPipeline();
+    } else {
+      el.innerHTML = `<span class="text-red">❌ 失败</span>`;
+    }
   } catch(e) {
     el.innerHTML = `<span class="text-red">❌</span>`;
   }
 }
 
+// ── 导航 ────────────────────────────────────────
 document.querySelectorAll('.sidebar-nav a').forEach(a => {
   a.addEventListener('click', ev => {
     ev.preventDefault();
@@ -166,6 +337,8 @@ document.querySelectorAll('.sidebar-nav a').forEach(a => {
 });
 
 loadPipeline();
+// 每 10 秒自动刷新列表（不覆盖已有的轮询）
+setInterval(loadPipeline, 10000);
 </script>
 </body>
 </html>

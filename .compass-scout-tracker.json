@@ -1,0 +1,92 @@
+{
+  "scans": [
+    {
+      "date": "2026-06-07",
+      "type": "full_scan",
+      "s_grade": ["人形机器人/具身智能"],
+      "a_grade": ["低空经济/eVTOL", "AI半导体设备", "AI Agent/智能体"],
+      "b_grade": [],
+      "c_grade": ["量子科技/核聚变"],
+      "signals_tracked": 45,
+      "report_file": "侦察-20260607.md"
+    }
+  ],
+  "active_tracks": [
+    {
+      "sector": "人形机器人/具身智能",
+      "first_identified": "2026-06-07",
+      "initial_grade": "S",
+      "current_grade": "S",
+      "composite_score": 0.952,
+      "signal_trend": "strengthening",
+      "key_catalysts": [
+        "宇树科技 IPO（已过会）",
+        "CES Asia 2026 (6.10-12)",
+        "中日韩智能制造大会 (6.24-27)",
+        "Tesla Optimus Q2 量产数据",
+        "绿的谐波/三花 Q2 机器人收入验证"
+      ],
+      "a_share_targets": [
+        "绿的谐波 (688017)",
+        "三花智控 (002050)",
+        "拓普集团 (601689)",
+        "鸣志电器 (603728)",
+        "贝斯特 (300580)",
+        "奥比中光 (688322)"
+      ],
+      "last_updated": "2026-06-07"
+    },
+    {
+      "sector": "低空经济/eVTOL",
+      "first_identified": "2026-06-07",
+      "initial_grade": "A",
+      "current_grade": "A",
+      "composite_score": 0.773,
+      "signal_trend": "strengthening",
+      "key_catalysts": [
+        "CES Asia 低空经济生态圈 (6.10-12)",
+        "东南亚低空经济博览会 (7.8-10)",
+        "亿航智能 Q2 交付数据",
+        "空域管理改革细则落地"
+      ],
+      "a_share_targets": [
+        "万丰奥威 (002085)",
+        "四川九洲 (000801)",
+        "莱斯信息 (688631)",
+        "纵横股份 (688070)",
+        "国睿科技 (600562)"
+      ],
+      "last_updated": "2026-06-07"
+    },
+    {
+      "sector": "AI半导体设备",
+      "first_identified": "2026-06-07",
+      "initial_grade": "A",
+      "current_grade": "A",
+      "composite_score": 0.749,
+      "signal_trend": "stable",
+      "warning": "量价热度 2 分——板块处历史高位，追高风险显著",
+      "key_catalysts": [
+        "长鑫科技 IPO 上会",
+        "NVIDIA Rubin 下半年量产",
+        "北方华创/中微 Q2 业绩"
+      ],
+      "a_share_targets": [
+        "北方华创 (002371)",
+        "中微公司 (688012)",
+        "拓荆科技 (688072)"
+      ],
+      "last_updated": "2026-06-07"
+    },
+    {
+      "sector": "AI Agent/智能体",
+      "first_identified": "2026-06-07",
+      "initial_grade": "A",
+      "current_grade": "A",
+      "composite_score": 0.707,
+      "signal_trend": "stable",
+      "caveat": "A股缺乏纯正Agent标的，建议通过机器人+算力间接配置",
+      "last_updated": "2026-06-07"
+    }
+  ]
+}

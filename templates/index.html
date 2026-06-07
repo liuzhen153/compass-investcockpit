@@ -154,61 +154,73 @@ async function loadDashboard() {
   }
 }
 
-// ── 快速操作 ─────────────────────────────────
+// ── 快速操作（fire-and-poll）───────────────────
+let quickOpPollId = null;
+
+function stopQuickOpPoll() {
+  if (quickOpPollId) {
+    clearInterval(quickOpPollId);
+    quickOpPollId = null;
+  }
+}
+
+async function fireAndPoll(url, label, s) {
+  stopQuickOpPoll();
+  try {
+    const resp = await fetch(url, { method: 'POST' });
+    const data = await resp.json();
+    if (data.status === 'accepted') {
+      s.innerHTML = `<span style="color:var(--primary)">🚀 ${label} 已触发 (${data.run_id.substring(0,8)}...)</span>`;
+
+      const startTime = Date.now();
+      const MAX_POLL = 60 * 60 * 1000;
+      quickOpPollId = setInterval(async () => {
+        try {
+          const r = await fetch(`/api/history/${data.run_id}`);
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          const run = await r.json();
+          const icons = { running: '⏳', success: '✅', failed: '❌', partial: '⚠️' };
+          s.innerHTML = `<span>${icons[run.status] || '🔄'} ${label}: ${run.status}`;
+
+          if (run.status === 'success' || run.status === 'failed' || run.status === 'partial') {
+            stopQuickOpPoll();
+            s.innerHTML = `<span>${icons[run.status]} ${label}: ${run.status} · ${run.duration_seconds ? Math.round(run.duration_seconds)+'s' : ''}</span>`;
+            loadDashboard();
+          }
+          if (Date.now() - startTime > MAX_POLL) {
+            stopQuickOpPoll();
+            s.innerHTML = `<span>⏰ ${label}: 超时，请查看 <a href="/history">历史</a></span>`;
+            loadDashboard();
+          }
+        } catch(e) { console.error(e); }
+      }, 2000);
+    } else {
+      s.innerHTML = `<span class="text-red">错误: ${JSON.stringify(data)}</span>`;
+    }
+  } catch(e) {
+    s.innerHTML = `<span class="text-red">错误: ${e.message}</span>`;
+  }
+}
+
 async function runPipeline() {
   const s = document.getElementById('quick-op-status');
-  s.innerHTML = '<span class="spinner"></span> 运行中...';
-  try {
-    const resp = await fetch('/api/pipeline/run', { method: 'POST' });
-    const data = await resp.json();
-    s.innerHTML = `<span class="text-${data.status === 'success' ? 'green' : 'red'}">${data.status}: ${data.summary || ''}</span>`;
-    setTimeout(loadDashboard, 2000);
-  } catch(e) {
-    s.innerHTML = `<span class="text-red">错误: ${e.message}</span>`;
-  }
+  const form = new FormData();
+  fireAndPoll('/api/pipeline/run', '流水线', s);
 }
-
 async function runScout() {
-  const s = document.getElementById('quick-op-status');
-  s.innerHTML = '<span class="spinner"></span> Scout 扫描中...';
-  try {
-    const resp = await fetch('/api/pipeline/scout', { method: 'POST' });
-    const data = await resp.json();
-    s.innerHTML = `<span class="text-${data.result.success ? 'green' : 'red'}">Scout: ${data.result.success ? '✅ 完成' : '❌ 失败'}</span>`;
-    setTimeout(loadDashboard, 2000);
-  } catch(e) {
-    s.innerHTML = `<span class="text-red">错误: ${e.message}</span>`;
-  }
+  fireAndPoll('/api/pipeline/scout', 'Scout', document.getElementById('quick-op-status'));
 }
-
 async function runCompass() {
-  const s = document.getElementById('quick-op-status');
-  s.innerHTML = '<span class="spinner"></span> Compass 分析中...';
-  try {
-    const resp = await fetch('/api/pipeline/compass', { method: 'POST' });
-    const data = await resp.json();
-    s.innerHTML = `<span class="text-${data.result.success ? 'green' : 'red'}">Compass: ${data.result.success ? '✅ 完成' : '❌ 失败'}</span>`;
-    setTimeout(loadDashboard, 2000);
-  } catch(e) {
-    s.innerHTML = `<span class="text-red">错误: ${e.message}</span>`;
-  }
+  fireAndPoll('/api/pipeline/compass', 'Compass', document.getElementById('quick-op-status'));
 }
-
 async function runTrader() {
-  const s = document.getElementById('quick-op-status');
-  s.innerHTML = '<span class="spinner"></span> Trader 更新中...';
-  try {
-    const resp = await fetch('/api/pipeline/trader', { method: 'POST' });
-    const data = await resp.json();
-    s.innerHTML = `<span class="text-${data.result.success ? 'green' : 'red'}">Trader: ${data.result.success ? '✅ 完成' : '❌ 失败'}</span>`;
-    setTimeout(loadDashboard, 2000);
-  } catch(e) {
-    s.innerHTML = `<span class="text-red">错误: ${e.message}</span>`;
-  }
+  fireAndPoll('/api/pipeline/trader', 'Trader', document.getElementById('quick-op-status'));
 }
 
 // 初始加载
 loadDashboard();
+// 每 15 秒自动刷新仪表盘
+setInterval(loadDashboard, 15000);
 </script>
 </body>
 </html>

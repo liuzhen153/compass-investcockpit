@@ -34,8 +34,8 @@ class TaskConfig(Base):
     skills = Column(JSON, default=list)  # ["compass-scout", "financial-compass"]
     prompt_template = Column(Text, default="")
     extra_config = Column(JSON, default=dict)  # 额外配置
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=config.now)
+    updated_at = Column(DateTime, default=config.now, onupdate=config.now)
     last_run_at = Column(DateTime, nullable=True)
     next_run_at = Column(DateTime, nullable=True)
 
@@ -54,8 +54,7 @@ class PipelineRun(Base):
     summary = Column(Text, default="")  # 运行摘要
     error_message = Column(Text, nullable=True)
     output_files = Column(JSON, default=list)  # [{"skill":"scout","file":"侦察-20260607.md"}]
-    created_at = Column(DateTime, default=datetime.utcnow)
-
+    created_at = Column(DateTime, default=config.now)
 
 # ── Skill 执行记录 ──────────────────────────────────
 class SkillExecution(Base):
@@ -74,8 +73,7 @@ class SkillExecution(Base):
     output_text = Column(Text, nullable=True)  # Claude 输出摘要
     output_files = Column(JSON, default=list)  # 生成的文件列表
     error_message = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
+    created_at = Column(DateTime, default=config.now)
 
 # ── 交易日历缓存 ────────────────────────────────────
 class TradingCalendar(Base):
@@ -85,8 +83,7 @@ class TradingCalendar(Base):
     date = Column(String(10), nullable=False, unique=True)
     is_trading_day = Column(Boolean, default=False)
     week_day = Column(Integer, nullable=True)  # 0=Mon, 6=Sun
-    created_at = Column(DateTime, default=datetime.utcnow)
-
+    created_at = Column(DateTime, default=config.now)
 
 # ── 引擎初始化 ──────────────────────────────────────
 sync_engine = create_engine(config.DATABASE_URL_SYNC, echo=False)
