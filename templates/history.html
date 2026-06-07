@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>运行历史 · Compass InvestCockpit</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="sidebar-header"><h1>🧭 Compass InvestCockpit</h1><div class="subtitle">指南针投资驾驶舱系统</div></div>
+    <nav class="sidebar-nav">
+      <a href="/">📊 <span>仪表盘</span></a>
+      <a href="/tasks">⚙️ <span>任务管理</span></a>
+      <a href="/history" class="active">📋 <span>运行历史</span></a>
+      <a href="/results">📁 <span>结果浏览</span></a>
+      <a href="/pipeline">🔗 <span>流水线</span></a>
+    </nav>
+  </aside>
+  <main class="main" id="main-content">
+    <div class="page-header">
+      <h2>📋 运行历史</h2>
+      <div class="flex-center">
+        <select class="form-input" style="width:auto" id="filter-status" onchange="loadHistory()">
+          <option value="">全部状态</option>
+          <option value="success">成功</option>
+          <option value="failed">失败</option>
+          <option value="partial">部分成功</option>
+          <option value="running">运行中</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="table-container">
+      <table>
+        <thead><tr>
+          <th>ID</th><th>触发方式</th><th>状态</th><th>开始时间</th><th>耗时</th><th>摘要</th><th>操作</th>
+        </tr></thead>
+        <tbody id="history-list"><tr><td colspan="7" class="text-muted">加载中...</td></tr></tbody>
+      </table>
+    </div>
+
+    <!-- 详情模态框 -->
+    <div class="modal-overlay" id="detail-modal">
+      <div class="modal" id="detail-content"></div>
+    </div>
+  </main>
+</div>
+
+<script>
+async function loadHistory() {
+  try {
+    const status = document.getElementById('filter-status')?.value || '';
+    const resp = await fetch('/api/history');
+    let runs = await resp.json();
+    if (status) runs = runs.filter(r => r.status === status);
+
+    document.getElementById('history-list').innerHTML = runs.map(r => `
+      <tr>
+        <td><code>${r.id}</code></td>
+        <td>${r.run_type === 'scheduled' ? '⏰ 定时' : '👤 手动'}</td>
+        <td><span class="status-badge ${r.status}">${r.status}</span></td>
+        <td class="text-sm">${r.started_at ? new Date(r.started_at).toLocaleString('zh-CN') : '-'}</td>
+        <td>${r.duration_seconds ? Math.round(r.duration_seconds) + 's' : '-'}</td>
+        <td class="text-sm">${r.summary || '-'}</td>
+        <td>
+          <button class="btn btn-sm" onclick="showDetail('${r.id}')">详情</button>
+          ${r.output_files?.length ? `<button class="btn btn-sm" onclick="event.stopPropagation();viewFiles('${r.id}')">📄${r.output_files.length}</button>` : ''}
+        </td>
+      </tr>
+    `).join('') || '<tr><td colspan="7" class="text-muted">暂无记录</td></tr>';
+  } catch(e) { console.error(e); }
+}
+
+async function showDetail(runId) {
+  const overlay = document.getElementById('detail-modal');
+  const content = document.getElementById('detail-content');
+  overlay.classList.add('show');
+  content.innerHTML = '<h3>加载中...</h3>';
+
+  try {
+    const resp = await fetch(`/api/history/${runId}`);
+    const r = await resp.json();
+    content.innerHTML = `
+      <div class="modal-header">
+        <h3>运行详情: <code>${r.id}</code></h3>
+        <button class="modal-close" onclick="document.getElementById('detail-modal').classList.remove('show')">✕</button>
+      </div>
+      <p><strong>状态:</strong> <span class="status-badge ${r.status}">${r.status}</span> | <strong>耗时:</strong> ${r.duration_seconds ? Math.round(r.duration_seconds) + 's' : '-'}</p>
+      <p><strong>摘要:</strong> ${r.summary || '-'}</p>
+      ${r.error_message ? `<p class="text-red"><strong>错误:</strong> ${r.error_message}</p>` : ''}
+
+      <h4 style="margin-top:16px">Skill 执行记录</h4>
+      <div class="table-container" style="margin-top:8px">
+        <table>
+          <thead><tr><th>顺序</th><th>Skill</th><th>状态</th><th>耗时</th><th>输出文件</th><th>错误</th></tr></thead>
+          <tbody>
+            ${r.executions.map(e => `
+              <tr>
+                <td>${e.sequence + 1}</td>
+                <td>${e.skill_name}</td>
+                <td><span class="status-badge ${e.status}">${e.status}</span></td>
+                <td>${e.duration_seconds ? Math.round(e.duration_seconds) + 's' : '-'}</td>
+                <td class="text-sm">${(e.output_files || []).map(f => `<a href="/api/results/file/raw?path=${encodeURIComponent(f.path)}" target="_blank">${f.filename}</a>`).join('<br>') || '-'}</td>
+                <td class="text-sm text-red">${e.error_message || '-'}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
+  } catch(e) {
+    content.innerHTML = `<p class="text-red">加载失败: ${e.message}</p>`;
+  }
+}
+
+function viewFiles(runId) {
+  showDetail(runId);
+}
+
+document.getElementById('detail-modal').addEventListener('click', function(e) {
+  if (e.target === this) this.classList.remove('show');
+});
+
+document.querySelectorAll('.sidebar-nav a').forEach(a => {
+  a.addEventListener('click', ev => {
+    ev.preventDefault();
+    history.pushState(null, '', a.href);
+    location.href = a.href;
+  });
+});
+
+loadHistory();
+</script>
+</body>
+</html>

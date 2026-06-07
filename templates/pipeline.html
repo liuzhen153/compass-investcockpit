@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>流水线 · Compass InvestCockpit</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="sidebar-header"><h1>🧭 Compass InvestCockpit</h1><div class="subtitle">指南针投资驾驶舱系统</div></div>
+    <nav class="sidebar-nav">
+      <a href="/">📊 <span>仪表盘</span></a>
+      <a href="/tasks">⚙️ <span>任务管理</span></a>
+      <a href="/history">📋 <span>运行历史</span></a>
+      <a href="/results">📁 <span>结果浏览</span></a>
+      <a href="/pipeline" class="active">🔗 <span>流水线</span></a>
+    </nav>
+  </aside>
+  <main class="main" id="main-content">
+    <div class="page-header">
+      <h2>🔗 投资研究流水线</h2>
+    </div>
+
+    <!-- 流水线图解 -->
+    <div class="card" style="margin-bottom:24px">
+      <h3 style="margin-bottom:16px">三段式流水线</h3>
+      <div class="pipeline-steps" id="pipeline-viz">
+        <div class="pipeline-step">
+          <div class="step-name">Step 1</div>
+          <div class="step-skill">🥇 Compass Scout</div>
+          <small class="text-muted">发现热门赛道</small>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-step">
+          <div class="step-name">Step 2</div>
+          <div class="step-skill">🥈 Financial Compass</div>
+          <small class="text-muted">深度分析标的</small>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="pipeline-step">
+          <div class="step-name">Step 3</div>
+          <div class="step-skill">🥉 Compass Trader</div>
+          <small class="text-muted">执行模拟交易</small>
+        </div>
+      </div>
+      <p class="text-muted text-sm mt-16">
+        Scout 发现方向 → Compass 深度分析 → Trader 执行交易。完整流水线串联三个 Skill，从发现到执行的自动化闭环。
+      </p>
+    </div>
+
+    <!-- 手动触发 -->
+    <div class="section">
+      <div class="section-title">🚀 手动触发流水线</div>
+      <div class="card">
+        <div class="form-group">
+          <label>可选：指定赛道（留空则自动从最新侦察中获取 S 级赛道）</label>
+          <input class="form-input" id="pipeline-sector" placeholder="例如：具身机器人、低空经济">
+        </div>
+        <div style="margin-top:12px" class="flex-center gap-16">
+          <button class="btn btn-primary" onclick="runFullPipeline()">▶ 运行完整流水线 (Scout → Compass → Trader)</button>
+          <span id="pipeline-status"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 单独执行 -->
+    <div class="section">
+      <div class="section-title">🔧 单独执行</div>
+      <div class="flex-center gap-16">
+        <div class="card" style="flex:1">
+          <h4 style="margin-bottom:8px">🥇 Compass Scout</h4>
+          <p class="text-muted text-sm" style="margin-bottom:12px">三大映射信号扫描，发现 S/A 级赛道</p>
+          <button class="btn btn-success" onclick="runSingle('scout')">▶ 运行 Scout</button>
+          <span id="scout-status"></span>
+        </div>
+        <div class="card" style="flex:1">
+          <h4 style="margin-bottom:8px">🥈 Financial Compass</h4>
+          <p class="text-muted text-sm" style="margin-bottom:12px">产业链定位 + 估值 + 风险分析</p>
+          <button class="btn btn-success" onclick="runSingle('compass')">▶ 运行 Compass</button>
+          <span id="compass-status"></span>
+        </div>
+        <div class="card" style="flex:1">
+          <h4 style="margin-bottom:8px">🥉 Compass Trader</h4>
+          <p class="text-muted text-sm" style="margin-bottom:12px">更新持仓行情 + 绩效快照</p>
+          <button class="btn btn-success" onclick="runSingle('trader')">▶ 运行 Trader</button>
+          <span id="trader-status"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 最近流水线运行 -->
+    <div class="section">
+      <div class="section-title">📋 最近流水线运行</div>
+      <div class="table-container">
+        <table>
+          <thead><tr><th>Run ID</th><th>状态</th><th>开始</th><th>耗时</th><th>Scout</th><th>Compass</th><th>Trader</th><th>文件</th></tr></thead>
+          <tbody id="pipeline-runs"><tr><td colspan="8" class="text-muted">加载中...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+async function loadPipeline() {
+  try {
+    const resp = await fetch('/api/history');
+    const runs = await resp.json();
+    document.getElementById('pipeline-runs').innerHTML = runs.map(r => {
+      const scoutExec = r.executions?.find(e => e.skill_name === 'compass-scout');
+      const compassExec = r.executions?.find(e => e.skill_name === 'financial-compass');
+      const traderExec = r.executions?.find(e => e.skill_name === 'compass-trader');
+      return `
+        <tr>
+          <td><code>${r.id}</code></td>
+          <td><span class="status-badge ${r.status}">${r.status}</span></td>
+          <td class="text-sm">${r.started_at ? new Date(r.started_at).toLocaleString('zh-CN') : '-'}</td>
+          <td>${r.duration_seconds ? Math.round(r.duration_seconds) + 's' : '-'}</td>
+          <td>${scoutExec ? `<span class="status-badge ${scoutExec.status}">${scoutExec.duration_seconds ? Math.round(scoutExec.duration_seconds)+'s' : scoutExec.status}</span>` : '-'}</td>
+          <td>${compassExec ? `<span class="status-badge ${compassExec.status}">${compassExec.duration_seconds ? Math.round(compassExec.duration_seconds)+'s' : compassExec.status}</span>` : '-'}</td>
+          <td>${traderExec ? `<span class="status-badge ${traderExec.status}">${traderExec.duration_seconds ? Math.round(traderExec.duration_seconds)+'s' : traderExec.status}</span>` : '-'}</td>
+          <td class="text-sm">${(r.output_files || []).length} 个</td>
+        </tr>
+      `;
+    }).join('') || '<tr><td colspan="8" class="text-muted">暂无记录</td></tr>';
+  } catch(e) { console.error(e); }
+}
+
+async function runFullPipeline() {
+  const s = document.getElementById('pipeline-status');
+  const sector = document.getElementById('pipeline-sector').value;
+  s.innerHTML = '<span class="spinner"></span> 流水线运行中...';
+  try {
+    const form = new FormData();
+    if (sector) form.append('sector', sector);
+    const resp = await fetch('/api/pipeline/run', { method: 'POST', body: form });
+    const data = await resp.json();
+    s.innerHTML = `<span class="text-${data.status === 'success' ? 'green' : 'red'}">${data.status}: ${data.summary || ''}</span>`;
+    loadPipeline();
+  } catch(e) {
+    s.innerHTML = `<span class="text-red">错误: ${e.message}</span>`;
+  }
+}
+
+async function runSingle(type) {
+  const el = document.getElementById(type + '-status');
+  el.innerHTML = '<span class="spinner"></span>';
+  try {
+    const resp = await fetch('/api/pipeline/' + type, { method: 'POST' });
+    const data = await resp.json();
+    el.innerHTML = `<span class="text-${data.result?.success ? 'green' : 'red'}">${data.result?.success ? '✅' : '❌'}</span>`;
+    loadPipeline();
+  } catch(e) {
+    el.innerHTML = `<span class="text-red">❌</span>`;
+  }
+}
+
+document.querySelectorAll('.sidebar-nav a').forEach(a => {
+  a.addEventListener('click', ev => {
+    ev.preventDefault();
+    history.pushState(null, '', a.href);
+    location.href = a.href;
+  });
+});
+
+loadPipeline();
+</script>
+</body>
+</html>

@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>任务管理 · Compass InvestCockpit</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="sidebar-header"><h1>🧭 Compass InvestCockpit</h1><div class="subtitle">指南针投资驾驶舱系统</div></div>
+    <nav class="sidebar-nav">
+      <a href="/">📊 <span>仪表盘</span></a>
+      <a href="/tasks" class="active">⚙️ <span>任务管理</span></a>
+      <a href="/history">📋 <span>运行历史</span></a>
+      <a href="/results">📁 <span>结果浏览</span></a>
+      <a href="/pipeline">🔗 <span>流水线</span></a>
+    </nav>
+  </aside>
+  <main class="main" id="main-content">
+    <div class="page-header">
+      <h2>⚙️ 任务管理</h2>
+      <button class="btn btn-primary" onclick="showAddModal()">+ 新增任务</button>
+    </div>
+
+    <div class="table-container">
+      <table>
+        <thead><tr>
+          <th>任务名称</th><th>类型</th><th>Cron 表达式</th><th>交易日</th><th>状态</th><th>上次运行</th><th>下次运行</th><th>操作</th>
+        </tr></thead>
+        <tbody id="task-list"><tr><td colspan="8" class="text-muted">加载中...</td></tr></tbody>
+      </table>
+    </div>
+
+    <!-- 交易日历 -->
+    <div class="section mt-16">
+      <div class="section-title">📅 近期交易日历</div>
+      <div id="calendar-view"></div>
+    </div>
+  </main>
+</div>
+
+<!-- 编辑任务弹窗 -->
+<div class="modal-overlay" id="edit-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>编辑任务</h3>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <form id="edit-form">
+      <input type="hidden" id="edit-id">
+      <div class="form-group">
+        <label>任务名称</label>
+        <input class="form-input" id="edit-name" required>
+      </div>
+      <div class="form-group">
+        <label>Cron 表达式</label>
+        <input class="form-input" id="edit-cron" placeholder="0 10 * * 6" required>
+        <small class="text-muted">格式: 分 时 日 月 周 (e.g., "0 9 * * 1-5" = 工作日 9:00)</small>
+      </div>
+      <div style="display:flex;gap:16px;margin-top:16px;">
+        <button type="submit" class="btn btn-primary">保存</button>
+        <button type="button" class="btn" onclick="closeModal()">取消</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+async function loadTasks() {
+  try {
+    const resp = await fetch('/api/tasks');
+    const tasks = await resp.json();
+    document.getElementById('task-list').innerHTML = tasks.map(t => `
+      <tr>
+        <td><strong>${t.name}</strong><br><small class="text-muted">${t.description}</small></td>
+        <td><code>${t.task_type}</code></td>
+        <td><code>${t.cron_expr}</code></td>
+        <td>${t.trading_day_only ? '✅ 仅交易日' : '任意'}</td>
+        <td>
+          <span class="toggle ${t.enabled ? 'on' : ''}" onclick="toggleTask('${t.id}')"></span>
+        </td>
+        <td class="text-sm">${t.last_run_at ? new Date(t.last_run_at).toLocaleString('zh-CN') : '从未'}</td>
+        <td class="text-sm">${t.next_run_at ? new Date(t.next_run_at).toLocaleString('zh-CN') : '-'}</td>
+        <td>
+          <button class="btn btn-sm btn-success" onclick="runTask('${t.id}')" title="手动触发">▶</button>
+          <button class="btn btn-sm" onclick="editTask('${t.id}','${t.name}','${t.cron_expr}')" title="编辑">✏️</button>
+        </td>
+      </tr>
+    `).join('') || '<tr><td colspan="8" class="text-muted">暂无任务</td></tr>';
+
+    // 交易日历
+    const calResp = await fetch('/api/calendar?days=28');
+    const days = await calResp.json();
+    const weeks = [];
+    for (let i = 0; i < days.length; i += 7) weeks.push(days.slice(i, i + 7));
+    document.getElementById('calendar-view').innerHTML = `
+      <div class="calendar-grid">
+        <div class="calendar-day header">一</div><div class="calendar-day header">二</div>
+        <div class="calendar-day header">三</div><div class="calendar-day header">四</div>
+        <div class="calendar-day header">五</div><div class="calendar-day header">六</div>
+        <div class="calendar-day header">日</div>
+        ${days.map(d => {
+          let cls = 'calendar-day';
+          if (d.is_trading_day) cls += ' trading';
+          else if ([6,0].includes(new Date(d.date).getDay())) cls += ' weekend';
+          if (d.is_today) cls += ' today';
+          return `<div class="${cls}" title="${d.date} ${d.weekday}">${d.date.slice(5)}</div>`;
+        }).join('')}
+      </div>
+    `;
+  } catch(e) { console.error(e); }
+}
+
+async function toggleTask(id) {
+  await fetch(`/api/tasks/${id}/toggle`, { method: 'POST' });
+  loadTasks();
+}
+
+async function runTask(id) {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+  await fetch(`/api/tasks/${id}/run`, { method: 'POST' });
+  btn.disabled = false;
+  btn.textContent = '▶';
+  loadTasks();
+}
+
+function editTask(id, name, cron) {
+  document.getElementById('edit-id').value = id;
+  document.getElementById('edit-name').value = name;
+  document.getElementById('edit-cron').value = cron;
+  document.getElementById('edit-modal').classList.add('show');
+}
+
+function closeModal() {
+  document.getElementById('edit-modal').classList.remove('show');
+}
+
+function showAddModal() {
+  document.getElementById('edit-id').value = '';
+  document.getElementById('edit-name').value = '';
+  document.getElementById('edit-cron').value = '';
+  document.getElementById('edit-modal').classList.add('show');
+}
+
+document.getElementById('edit-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const id = document.getElementById('edit-id').value;
+  const name = document.getElementById('edit-name').value;
+  const cron = document.getElementById('edit-cron').value;
+  if (id) {
+    const form = new FormData();
+    form.append('name', name);
+    form.append('cron_expr', cron);
+    await fetch(`/api/tasks/${id}`, { method: 'PUT', body: form });
+  }
+  closeModal();
+  loadTasks();
+});
+
+// 导航
+document.querySelectorAll('.sidebar-nav a').forEach(a => {
+  a.addEventListener('click', ev => {
+    ev.preventDefault();
+    history.pushState(null, '', a.href);
+    location.href = a.href;
+  });
+});
+
+loadTasks();
+</script>
+</body>
+</html>

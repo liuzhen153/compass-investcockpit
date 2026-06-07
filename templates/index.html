@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Compass InvestCockpit · 指南针投资驾驶舱</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <h1>🧭 Compass InvestCockpit</h1>
+      <div class="subtitle">指南针投资驾驶舱系统</div>
+    </div>
+    <nav class="sidebar-nav">
+      <a href="/" class="active" data-page="index">
+        <span class="icon">📊</span> <span>仪表盘</span>
+      </a>
+      <a href="/tasks" data-page="tasks">
+        <span class="icon">⚙️</span> <span>任务管理</span>
+      </a>
+      <a href="/history" data-page="history">
+        <span class="icon">📋</span> <span>运行历史</span>
+      </a>
+      <a href="/results" data-page="results">
+        <span class="icon">📁</span> <span>结果浏览</span>
+      </a>
+      <a href="/pipeline" data-page="pipeline">
+        <span class="icon">🔗</span> <span>流水线</span>
+      </a>
+    </nav>
+  </aside>
+  <main class="main" id="main-content">
+    <div class="page-header">
+      <h2>📊 仪表盘</h2>
+      <span class="status-badge" id="sys-status">加载中...</span>
+    </div>
+
+    <!-- 状态卡片 -->
+    <div class="cards" id="stats-cards">
+      <div class="card"><div class="card-label">总运行次数</div><div class="card-value" id="stat-runs">-</div></div>
+      <div class="card"><div class="card-label">成功率</div><div class="card-value text-green" id="stat-success">-</div></div>
+      <div class="card"><div class="card-label">活跃任务</div><div class="card-value text-blue" id="stat-tasks">-</div></div>
+      <div class="card"><div class="card-label">输出文件</div><div class="card-value" id="stat-files">-</div></div>
+      <div class="card"><div class="card-label">今日市场</div><div class="card-value" id="stat-market">-</div></div>
+    </div>
+
+    <!-- 下一步行动 -->
+    <div class="section">
+      <div class="section-title">⚡ 快速操作</div>
+      <div class="flex-center gap-16">
+        <button class="btn btn-primary" onclick="runPipeline()">▶ 运行完整流水线</button>
+        <button class="btn btn-success" onclick="runScout()">🔍 仅 Scout 扫描</button>
+        <button class="btn" onclick="runCompass()">📈 仅 Compass 分析</button>
+        <button class="btn" onclick="runTrader()">💼 仅 Trader 更新</button>
+        <span id="quick-op-status"></span>
+      </div>
+    </div>
+
+    <!-- 最近运行 -->
+    <div class="section">
+      <div class="section-title">📋 最近运行</div>
+      <div class="table-container">
+        <table>
+          <thead><tr>
+            <th>时间</th><th>类型</th><th>状态</th><th>耗时</th><th>摘要</th><th>操作</th>
+          </tr></thead>
+          <tbody id="recent-runs"><tr><td colspan="6" class="text-muted">加载中...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 定时任务 -->
+    <div class="section">
+      <div class="section-title">⏰ 定时任务</div>
+      <div class="table-container">
+        <table>
+          <thead><tr>
+            <th>任务</th><th>调度</th><th>交易日约束</th><th>上次运行</th><th>下次运行</th><th>状态</th>
+          </tr></thead>
+          <tbody id="task-list"><tr><td colspan="6" class="text-muted">加载中...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 最新侦察 -->
+    <div class="section">
+      <div class="section-title">🔍 最新侦察结果</div>
+      <div id="latest-scout" class="text-muted">加载中...</div>
+    </div>
+  </main>
+</div>
+
+<script>
+// ── 页面导航（常规整页跳转）─────────────────
+document.querySelectorAll('.sidebar-nav a').forEach(a => {
+  a.addEventListener('click', ev => {
+    ev.preventDefault();
+    location.href = a.href;
+  });
+});
+
+// ── 仪表盘数据 ─────────────────────────────────
+async function loadDashboard() {
+  try {
+    const resp = await fetch('/api/dashboard');
+    const data = await resp.json();
+
+    document.getElementById('sys-status').textContent = data.is_trading_day ? '🟢 交易日' : '⚫ 非交易日';
+    document.getElementById('sys-status').className = 'status-badge ' + (data.is_trading_day ? 'success' : 'pending');
+    document.getElementById('stat-runs').textContent = data.stats.total_runs;
+    document.getElementById('stat-success').textContent = data.stats.total_runs > 0
+      ? Math.round(data.stats.success_runs / data.stats.total_runs * 100) + '%'
+      : '-';
+    document.getElementById('stat-tasks').textContent = data.stats.active_tasks;
+    document.getElementById('stat-files').textContent = data.stats.output_files;
+    document.getElementById('stat-market').textContent = data.is_trading_day
+      ? (data.is_trading_time ? '🟢 交易中' : '⏸ 盘前/盘后')
+      : '休市';
+
+    // 最近运行
+    const runsTbody = document.getElementById('recent-runs');
+    runsTbody.innerHTML = data.recent_runs.map(r => `
+      <tr>
+        <td>${r.started_at ? new Date(r.started_at).toLocaleString('zh-CN') : '-'}</td>
+        <td>${r.run_type === 'scheduled' ? '⏰ 定时' : '👤 手动'}</td>
+        <td><span class="status-badge ${r.status}">${r.status}</span></td>
+        <td>${r.duration_seconds ? Math.round(r.duration_seconds) + 's' : '-'}</td>
+        <td class="text-sm">${r.summary}</td>
+        <td><a href="/history" class="btn btn-sm">详情</a></td>
+      </tr>
+    `).join('');
+
+    // 定时任务
+    const tasksTbody = document.getElementById('task-list');
+    tasksTbody.innerHTML = data.tasks.map(t => `
+      <tr>
+        <td>${t.name}</td>
+        <td><code class="text-sm">${t.cron_expr}</code></td>
+        <td>${t.trading_day_only ? '✅ 仅交易日' : '任意'}</td>
+        <td>${t.last_run_at ? new Date(t.last_run_at).toLocaleString('zh-CN') : '从未'}</td>
+        <td>${t.next_run_at ? new Date(t.next_run_at).toLocaleString('zh-CN') : '-'}</td>
+        <td><span class="status-badge ${t.enabled ? 'success' : 'pending'}">${t.enabled ? '启用' : '禁用'}</span></td>
+      </tr>
+    `).join('');
+
+    // 最新侦察
+    document.getElementById('latest-scout').innerHTML = data.latest_scout_files.length > 0
+      ? data.latest_scout_files.map(f => `<div style="padding:8px 0;border-bottom:1px solid var(--border)">📄 <a href="/api/results/file/raw?path=${encodeURIComponent(f.path)}" target="_blank">${f.filename}</a> <span class="text-muted text-sm">${new Date(f.modified).toLocaleString('zh-CN')}</span></div>`).join('')
+      : '暂无侦察结果';
+  } catch(e) {
+    console.error(e);
+  }
+}
+
+// ── 快速操作 ─────────────────────────────────
+async function runPipeline() {
+  const s = document.getElementById('quick-op-status');
+  s.innerHTML = '<span class="spinner"></span> 运行中...';
+  try {
+    const resp = await fetch('/api/pipeline/run', { method: 'POST' });
+    const data = await resp.json();
+    s.innerHTML = `<span class="text-${data.status === 'success' ? 'green' : 'red'}">${data.status}: ${data.summary || ''}</span>`;
+    setTimeout(loadDashboard, 2000);
+  } catch(e) {
+    s.innerHTML = `<span class="text-red">错误: ${e.message}</span>`;
+  }
+}
+
+async function runScout() {
+  const s = document.getElementById('quick-op-status');
+  s.innerHTML = '<span class="spinner"></span> Scout 扫描中...';
+  try {
+    const resp = await fetch('/api/pipeline/scout', { method: 'POST' });
+    const data = await resp.json();
+    s.innerHTML = `<span class="text-${data.result.success ? 'green' : 'red'}">Scout: ${data.result.success ? '✅ 完成' : '❌ 失败'}</span>`;
+    setTimeout(loadDashboard, 2000);
+  } catch(e) {
+    s.innerHTML = `<span class="text-red">错误: ${e.message}</span>`;
+  }
+}
+
+async function runCompass() {
+  const s = document.getElementById('quick-op-status');
+  s.innerHTML = '<span class="spinner"></span> Compass 分析中...';
+  try {
+    const resp = await fetch('/api/pipeline/compass', { method: 'POST' });
+    const data = await resp.json();
+    s.innerHTML = `<span class="text-${data.result.success ? 'green' : 'red'}">Compass: ${data.result.success ? '✅ 完成' : '❌ 失败'}</span>`;
+    setTimeout(loadDashboard, 2000);
+  } catch(e) {
+    s.innerHTML = `<span class="text-red">错误: ${e.message}</span>`;
+  }
+}
+
+async function runTrader() {
+  const s = document.getElementById('quick-op-status');
+  s.innerHTML = '<span class="spinner"></span> Trader 更新中...';
+  try {
+    const resp = await fetch('/api/pipeline/trader', { method: 'POST' });
+    const data = await resp.json();
+    s.innerHTML = `<span class="text-${data.result.success ? 'green' : 'red'}">Trader: ${data.result.success ? '✅ 完成' : '❌ 失败'}</span>`;
+    setTimeout(loadDashboard, 2000);
+  } catch(e) {
+    s.innerHTML = `<span class="text-red">错误: ${e.message}</span>`;
+  }
+}
+
+// 初始加载
+loadDashboard();
+</script>
+</body>
+</html>

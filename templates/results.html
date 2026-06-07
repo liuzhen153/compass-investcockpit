@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>结果浏览 · Compass InvestCockpit</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="sidebar-header"><h1>🧭 Compass InvestCockpit</h1><div class="subtitle">指南针投资驾驶舱系统</div></div>
+    <nav class="sidebar-nav">
+      <a href="/">📊 <span>仪表盘</span></a>
+      <a href="/tasks">⚙️ <span>任务管理</span></a>
+      <a href="/history">📋 <span>运行历史</span></a>
+      <a href="/results" class="active">📁 <span>结果浏览</span></a>
+      <a href="/pipeline">🔗 <span>流水线</span></a>
+    </nav>
+  </aside>
+  <main class="main" id="main-content">
+    <div class="page-header">
+      <h2>📁 结果浏览</h2>
+      <div class="flex-center">
+        <select class="form-input" style="width:auto" id="filter-type" onchange="loadResults()">
+          <option value="">全部类型</option>
+          <option value="scout">侦察报告</option>
+          <option value="sector">赛道分析</option>
+          <option value="stock">个股分析</option>
+          <option value="fund">基金分析</option>
+          <option value="weekly">周报</option>
+          <option value="monthly">月报</option>
+          <option value="compare">对比分析</option>
+        </select>
+        <input class="form-input" style="width:200px" placeholder="搜索文件名..." id="filter-search" oninput="loadResults()">
+      </div>
+    </div>
+
+    <!-- 文件列表 -->
+    <div class="section">
+      <div class="table-container">
+        <table>
+          <thead><tr><th>文件名</th><th>类型</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead>
+          <tbody id="file-list"><tr><td colspan="5" class="text-muted">加载中...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 文件内容预览模态框 -->
+    <div class="modal-overlay" id="preview-modal">
+      <div class="modal" style="max-width:1000px">
+        <div class="modal-header">
+          <h3 id="preview-title">文件预览</h3>
+          <button class="modal-close" onclick="document.getElementById('preview-modal').classList.remove('show')">✕</button>
+        </div>
+        <div class="md-content" id="preview-content">加载中...</div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+const typeLabels = {
+  scout: '🔍 侦察', sector: '🏭 赛道', stock: '📈 个股', fund: '💰 基金',
+  weekly: '📊 周报', monthly: '📅 月报', compare: '⚖️ 对比', trade: '💼 交易',
+  portfolio: '📋 组合', other: '📄 其他'
+};
+
+async function loadResults() {
+  try {
+    const type = document.getElementById('filter-type').value;
+    const search = document.getElementById('filter-search').value.toLowerCase();
+    let url = '/api/results';
+    if (type) url += '?type=' + type;
+
+    const resp = await fetch(url);
+    let files = await resp.json();
+    if (search) files = files.filter(f => f.filename.toLowerCase().includes(search));
+
+    document.getElementById('file-list').innerHTML = files.map(f => `
+      <tr>
+        <td><strong>${f.filename}</strong></td>
+        <td><span class="status-badge" style="background:var(--surface2)">${typeLabels[f.type] || f.type}</span></td>
+        <td>${f.size_kb} KB</td>
+        <td class="text-sm">${new Date(f.modified).toLocaleString('zh-CN')}</td>
+        <td>
+          <button class="btn btn-sm btn-primary" onclick="previewFile('${encodeURIComponent(f.path)}', '${f.filename}')">预览</button>
+          <a href="/api/results/file/raw?path=${encodeURIComponent(f.path)}" target="_blank" class="btn btn-sm">打开</a>
+        </td>
+      </tr>
+    `).join('') || '<tr><td colspan="5" class="text-muted">暂无文件</td></tr>';
+  } catch(e) { console.error(e); }
+}
+
+async function previewFile(path, filename) {
+  const overlay = document.getElementById('preview-modal');
+  const content = document.getElementById('preview-content');
+  document.getElementById('preview-title').textContent = filename;
+  overlay.classList.add('show');
+  content.innerHTML = '<div class="spinner"></div> 加载中...';
+
+  try {
+    const resp = await fetch(`/api/results/file?path=${path}`);
+    const data = await resp.json();
+    // 简单的 Markdown → HTML 转换
+    let html = data.content
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+      .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+      .replace(/^# (.+)$/gm, '<h1>$1</h1>')
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*(.+?)\*/g, '<em>$1</em>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/^- (.+)$/gm, '<li>$1</li>')
+      .replace(/^---$/gm, '<hr>')
+      .replace(/\n\n/g, '</p><p>')
+      .replace(/\|(.+)\|/g, (match) => {
+        const cells = match.split('|').filter(c => c.trim());
+        if (cells.every(c => /^[-:]+$/.test(c.trim()))) return '';
+        const tag = match.includes('\n-') ? 'th' : 'td';
+        return '<tr>' + cells.map(c => `<${tag}>${c.trim()}</${tag}>`).join('') + '</tr>';
+      });
+
+    content.innerHTML = '<p>' + html + '</p>';
+  } catch(e) {
+    content.innerHTML = `<p class="text-red">加载失败: ${e.message}</p>`;
+  }
+}
+
+document.getElementById('preview-modal').addEventListener('click', function(e) {
+  if (e.target === this) this.classList.remove('show');
+});
+
+document.querySelectorAll('.sidebar-nav a').forEach(a => {
+  a.addEventListener('click', ev => {
+    ev.preventDefault();
+    history.pushState(null, '', a.href);
+    location.href = a.href;
+  });
+});
+
+loadResults();
+</script>
+</body>
+</html>
